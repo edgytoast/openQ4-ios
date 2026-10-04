@@ -1,0 +1,808 @@
+--- a/src/sys/osx/macosx_sdl3_main.cpp
++++ b/src/sys/osx/macosx_sdl3_main.cpp
+@@ -11,12 +11,35 @@
+ 
+ #include "../../idlib/precompiled.h"
+ #include "../../framework/Common.h"
++#include "../../framework/Session_local.h"   // sessLocal, for the demo-playback predicate
+ #include "../posix/posix_public.h"
+ #include "../sys_public.h"
+ 
+ #define SDL_MAIN_HANDLED
++#if !defined( OPENQ4_SWIFT_MAIN )
++// Deliberately NOT included under OPENQ4_SWIFT_MAIN (visionOS): SDL_main.h is
++// the header that supplies SDL_RunApp and the platform main() shim, and on a
++// SwiftUI-entry app neither is wanted - see the entry point at the bottom of
++// this file.
+ #include <SDL3/SDL_main.h>
++#endif
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include <SDL3/SDL_system.h>
++#include <SDL3/SDL_video.h>
++#include "openq4_ios_bridge.h"
++#include "openq4_ios_blackbox.h"
++#include "openq4_ios_audio.h"
++#include "openq4_ios_audiotest.h"
++#include "openq4_ios_metrics.h"      // from ios/shell, on the include path
++#include "openq4_ios_onboarding.h"
++#include "openq4_ios_touch.h"
++#include "openq4_ios_settings.h"
++#include "openq4_ios_fontcheck.h"
++#endif
++
++
+ static void Sys_HandlePendingQuitSignal(void) {
+ 	const int quitSignal = Posix_ConsumeQuitSignal();
+ 	if (quitSignal == 0) {
+@@ -26,40 +49,767 @@
+ 	Posix_SetExit(128 + quitSignal);
+ 	common->Printf("Exiting on %s\n", Posix_SignalName(quitSignal));
+ 	common->Quit();
++}
++
++#if TARGET_OS_IPHONE
++/*
++================
++OpenQ4_iOSFrame
++
++iOS drives the frame from a CADisplayLink, not from a loop we own.
++
++The desktop entry point below ends in a blocking `while (1) common->Frame()`.
++That cannot work here: UIKit requires the main thread to return to its run loop,
++and an app that never does is killed by the watchdog. SDL3 exposes exactly the
++hook needed - SDL_SetiOSAnimationCallback installs a CADisplayLink that calls
++back once per display refresh - so the loop inverts: register this, return, and
++let the link drive.
++
++This also lands the charter's pacing requirement for free (Phase 0.6): the
++display link becomes the single pacer, with one present per rendered frame.
++================
++*/
++/*
++================
++OpenQ4_iOS_BridgeExecuteCommand
++
++Called by the shell's console bridge, on the frame thread only. idCmdSystem is
++not thread-safe, so the bridge queues on its socket thread and this is the
++single point where a remote command enters the engine.
++================
++*/
++/*
++================
++OpenQ4_iOS_FrameLinkCmd
++
++`iosframelink` — prints display-link health over the bridge. The three ways
++"no frames" can happen look identical from outside: the link stopped being
++delivered, ticks arrive but are dropped by the re-entrancy guard, or ticks run
++and the engine does nothing. This tells them apart.
++================
++*/
++/*
++================
++`iostouch 0|1` — force the touch overlay visible or hidden.
++
++The overlay normally follows the engine's GUI state, so it is invisible in menus
++— which on the simulator means invisible always, since the simulator cannot
++reach gameplay. This exists so its layout can still be verified with a
++screenshot there.
++================
++*/
++static void OpenQ4_iOS_TouchCmd( const idCmdArgs &args ) {
++	const int visible = ( args.Argc() > 1 ) ? atoi( args.Argv( 1 ) ) : 1;
++	OpenQ4_iOS_TouchSetVisible( visible );
++	common->Printf( "iOS touch overlay forced %s\n", visible ? "visible" : "hidden" );
++}
++
++static void OpenQ4_iOS_SettingsCmd( const idCmdArgs &args ) {
++	(void)args;
++	OpenQ4_iOS_ShowSettings();
++}
++
++static void OpenQ4_iOS_FrameLinkCmd( const idCmdArgs &args ) {
++	(void)args;
++	OpenQ4_iOS_ReportFrameLoop();
++}
++
++/*
++================
++Touch and settings bridge
++
++The shell speaks in game concepts (move, look, "attack") and these translate
++into the engine's own input events. Movement uses the joystick axis path, which
++is analogue and needs no key mapping; buttons go through the command system's
+++/- bindings so they honour whatever the player has bound.
++
++Look currently rides SE_MOUSE, which means it passes through the engine's mouse
++sensitivity chain. The charter asks for absolute view degrees instead, and that
++remains the right end state — the shell already computes degrees, so the change
++is confined to how they are delivered. Noted rather than silently accepted.
++================
++*/
++extern "C" void OpenQ4_iOS_SetTouchMove( float forward, float right );
++
++extern "C" void OpenQ4_iOS_InjectMove( float forward, float right ) {
++	// Straight to the usercmd generator's own touch-move state. This used to
++	// post SE_JOYSTICK_AXIS events, and the SDL backend rewrites the joystick
++	// axis array on every pump — so the stick's value was overwritten before it
++	// could ever reach a usercmd, and the on-screen stick did nothing at all.
++	OpenQ4_iOS_SetTouchMove( forward, right );
++}
++
++extern "C" void OpenQ4_iOS_AccumulateLook( float yawDegrees, float pitchDegrees );
++
++extern "C" void OpenQ4_iOS_InjectLook( float yawDegrees, float pitchDegrees ) {
++	// Straight through to the usercmd generator's absolute-degree accumulator.
++	// This used to synthesise SE_MOUSE counts, which meant the shell's look
++	// slider was scaled again by sensitivity/m_yaw/m_pitch/m_cpi/cl_mouseAccel
++	// and quantised to whole mouse counts on the way — so slow drags lost
++	// motion entirely to integer truncation, and the slider's meaning changed
++	// whenever the mouse cvars did.
++	OpenQ4_iOS_AccumulateLook( yawDegrees, pitchDegrees );
++}
++
++bool Sys_SDL_PumpEvents( void );
++extern "C" void OpenQ4_iOS_ApplyPendingTextInput( void );
++
++extern "C" void OpenQ4_iOS_PumpSDLEvents( void ) {
++	// Called from the display-link tick on the MAIN thread. SDL's event pump and
++	// window APIs are main-thread-only on Darwin, and the engine now runs on its
++	// own thread, so the pump has to be driven from here. Sys_SDL_PumpEvents
++	// pushes into the mutex-protected engine event queue that the engine thread
++	// drains — the same split upstream already uses for the async input thread.
++	(void)Sys_SDL_PumpEvents();
++
++	// Presenting or dismissing the iOS keyboard is UIKit work, and the engine
++	// thread may only ASK for it. This is where the ask is honoured.
++	OpenQ4_iOS_ApplyPendingTextInput();
++}
++
++#define OPENQ4_TOUCH_BUTTON_QUEUE 32
++static char s_touchButtonNames[OPENQ4_TOUCH_BUTTON_QUEUE][32];
++static bool s_touchButtonDown[OPENQ4_TOUCH_BUTTON_QUEUE];
++static int  s_touchButtonQueueCount = 0;
++
++extern "C" void OpenQ4_iOS_SetTouchButtonByName( const char *name, int down );
++
++static SDL_Window *OpenQ4_iOSFindWindow( void );   // defined further down
++
++extern "C" void OpenQ4_iOS_StopTextInput( void ) {
++	// Resigning first responder alone is not enough: SDL re-presents the
++	// keyboard whenever it still believes text input is active, which is why it
++	// came back on returning to the menu.
++	SDL_Window *window = OpenQ4_iOSFindWindow();
++	if ( window != NULL ) {
++		SDL_StopTextInput( window );
++	}
++}
++
++extern "C" void OpenQ4_iOS_InjectJoyKeyState( int joyIndex, int down ) {
++	// Press and release are SEPARATE, because objectives is a held display, not
++	// a toggle: the maintainer's report is that HOLDING D-pad up shows it. Sending down
++	// and up together — which is what this used to do — is a press the game
++	// never sees as held, and the screen never appears.
++	//
++	// K_JOY1..K_JOY16 are contiguous, so JOY9 (D-pad up) is K_JOY1 + 8.
++	if ( joyIndex < 1 || joyIndex > 16 ) {
++		return;
++	}
++	const int key = K_JOY1 + ( joyIndex - 1 );
++	Posix_QueEvent( SE_KEY, key, down ? 1 : 0, 0, NULL );
++}
++
++extern "C" void OpenQ4_iOS_QueueWheelMouseDelta( int dx, int dy );
++
++extern "C" void OpenQ4_iOS_InjectWheelAim( float dx, float dy ) {
++	// The weapon wheel reads usercmd.mx/my, and usercmd.mx/my is filled ONLY by
++	// idUsercmdGenLocal::Mouse() draining the SDL backend's s_mouseQueue. This
++	// used to post SE_MOUSE into the sys event queue instead — the plane that
++	// feeds GUIs and binds, which the usercmd generator never looks at. The
++	// deltas were therefore discarded, and the wheel was in fact being steered
++	// by the game's LOOK-ANGLE fallback (Player.cpp UpdateWeaponWheelCursor),
++	// which is driven by the second finger on the look area. That single fact
++	// explains all three complaints at once: it needed a second finger, it was
++	// mirrored, and at 0.08 cursor-units per degree against a 118-unit radius it
++	// took roughly four full turns of the view to cross the wheel.
++	//
++	// No negation here. Positive dx means the cursor goes right, and once real
++	// counts arrive the mouse path also suppresses the look fallback.
++	const int ix = (int)dx;
++	const int iy = (int)dy;
++	if ( ix != 0 || iy != 0 ) {
++		OpenQ4_iOS_QueueWheelMouseDelta( ix, iy );
++	}
++}
++
++extern "C" int OpenQ4_iOS_AwaitingContinue( void ) {
++	// True while the engine is sitting on its "press any key to continue" screen
++	// after a map load. That gate is a blocking loop inside ExecuteMapChange, so
++	// the shell cannot see it as an ordinary game state — it has to ask.
++	return openQ4_AcceptingLoadingContinueInput() ? 1 : 0;
++}
++
++extern "C" void OpenQ4_iOS_InjectContinueKey( void ) {
++	// Space, not escape: the gate accepts any key, but escape is also the menu
++	// key, and a stray escape arriving just after the gate closes opens the pause
++	// menu the instant the player lands in the map.
++	Posix_QueEvent( SE_KEY, K_SPACE, 1, 0, NULL );
++	Posix_QueEvent( SE_KEY, K_SPACE, 0, 0, NULL );
++}
++
++extern "C" void OpenQ4_iOS_InjectEscape( void ) {
++	// A press/release pair in one call. The engine's menu handling triggers on
++	// the down edge, but leaving the key latched down would leave the console
++	// and GUI code believing escape is held for the rest of the session.
++	Posix_QueEvent( SE_KEY, K_ESCAPE, 1, 0, NULL );
++	Posix_QueEvent( SE_KEY, K_ESCAPE, 0, 0, NULL );
++}
++
++extern "C" void OpenQ4_iOS_InjectButton( const char *name, int down ) {
++	if ( name == NULL || name[0] == '\0' ) {
++		return;
++	}
++	// Queued, not executed here. This runs on the MAIN thread (a UIKit button
++	// handler) while the engine runs on its own thread, and idCmdSystem is not
++	// thread-safe — buffering from here did nothing at all, which is why every
++	// on-screen button was dead while look, which takes an atomic path, worked.
++	//
++	// Still routed through the command system when it is finally executed, so
++	// the buttons behave exactly like a bound key ("+attack"/"-attack") and
++	// respect the player's own bindings.
++	Sys_EnterCriticalSection( CRITICAL_SECTION_ONE );
++	if ( s_touchButtonQueueCount < OPENQ4_TOUCH_BUTTON_QUEUE ) {
++		idStr::Copynz( s_touchButtonNames[ s_touchButtonQueueCount ], name,
++				sizeof( s_touchButtonNames[0] ) );
++		s_touchButtonDown[ s_touchButtonQueueCount ] = ( down != 0 );
++		s_touchButtonQueueCount++;
++	}
++	Sys_LeaveCriticalSection( CRITICAL_SECTION_ONE );
++}
++
++/*
++================
++Drain the touch button queue. Called from the engine thread at the top of a
++frame, where idCmdSystem is safe to touch.
++================
++*/
++static void OpenQ4_iOS_DrainTouchButtons( void ) {
++	char names[OPENQ4_TOUCH_BUTTON_QUEUE][32];
++	bool downs[OPENQ4_TOUCH_BUTTON_QUEUE];
++	int  count = 0;
++
++	Sys_EnterCriticalSection( CRITICAL_SECTION_ONE );
++	count = s_touchButtonQueueCount;
++	for ( int i = 0; i < count; i++ ) {
++		idStr::Copynz( names[i], s_touchButtonNames[i], sizeof( names[0] ) );
++		downs[i] = s_touchButtonDown[i];
++	}
++	s_touchButtonQueueCount = 0;
++	Sys_LeaveCriticalSection( CRITICAL_SECTION_ONE );
++
++	for ( int i = 0; i < count; i++ ) {
++		OpenQ4_iOS_SetTouchButtonByName( names[i], downs[i] ? 1 : 0 );
++	}
++}
++
++/*
++================
++OpenQ4_iOS_InGame
++
++Whether the player is in a map rather than a menu, so the touch overlay can
++show and hide itself without the shell tracking session state on its own.
++================
++*/
++/*
++ * True while a cinematic is playing.
++ *
++ * A touch player needs a way past one, and the MENU button is deliberately not
++ * on screen outside menus. So the overlay treats a tap anywhere during a
++ * cinematic as escape, which is what the engine skips on — no chrome, no
++ * gesture to learn, and it matches what a tap does in every other video player.
++ */
++extern "C" int OpenQ4_iOS_InCinematic( void ) {
++	if ( session == NULL || game == NULL ) {
++		return 0;
++	}
++	if ( session->IsGUIActive() ) {
++		return 0;
++	}
++	// Never during demo playback (D-086): a demo of a map that runs a cinematic
++	// would turn every stray tap into an escape, and escape during playback is
++	// the transport deck rather than a skip.
++	if ( OpenQ4_iOS_InDemoPlayback() ) {
++		return 0;
++	}
++	return game->InCinematic() ? 1 : 0;
++}
++
++/*
++ * True while a demo is being PLAYED BACK (openQ4-ios D-086).
++ *
++ * A demo plays back with no player to steer, so the sticks, the fire button and
++ * the whole action cluster are not merely useless — they sit on top of the
++ * thing the viewer is trying to watch. The chrome stays: the hamburger is how
++ * the transport deck is opened (the engine binds Escape to it during playback,
++ * Session.cpp), and the gear is how a viewer reaches the iOS settings.
++ *
++ * IsGUIActive() is false during playback with the deck closed, so InGame()
++ * answers 1 and cannot make this distinction on its own.
++ */
++extern "C" int OpenQ4_iOS_InDemoPlayback( void ) {
++	if ( session == NULL ) {
++		return 0;
++	}
++	return sessLocal.IsDemoPlaybackActive() ? 1 : 0;
++}
++
++/*
++ * True while a demo is being RECORDED. The settings sheet's Demos row reads it
++ * so the row can say which of the two things it will do (D-086).
++ */
++extern "C" int OpenQ4_iOS_IsRecordingDemo( void ) {
++	return ( session != NULL && session->writeDemo != NULL ) ? 1 : 0;
++}
++
++extern "C" int OpenQ4_iOS_InGame( void ) {
++	// IsGUIActive() covers the main menu, the in-game menu and full-screen GUIs
++	// alike, which is exactly the set of states where touch controls should be
++	// out of the way and the engine's own cursor should have the screen.
++	if ( session == NULL ) {
++		return 0;
++	}
++	return session->IsGUIActive() ? 0 : 1;
++}
++
++#define OPENQ4_CVAR_QUEUE 64
++static char s_cvarQueueName[OPENQ4_CVAR_QUEUE][64];
++static char s_cvarQueueValue[OPENQ4_CVAR_QUEUE][64];
++static int  s_cvarQueueCount = 0;
++static int  s_cvarQueueOverflows = 0;
++
++/*
++ * Queued, not applied here.
++ *
++ * Every caller of this is the settings sheet, which runs on the MAIN thread,
++ * while the engine runs on its own thread — and idCvarSystem is no more
++ * thread-safe than idCmdSystem was. Writing straight through appeared to work
++ * and did not: brightness did nothing, the FPS counter did nothing, and the
++ * resolution preset did nothing, all for the same reason the on-screen buttons
++ * did nothing before they were queued.
++ */
++extern "C" void OpenQ4_iOS_SetCvar( const char *name, const char *value ) {
++	if ( name == NULL || value == NULL ) {
++		return;
++	}
++
++	Sys_EnterCriticalSection( CRITICAL_SECTION_ONE );
++	/*
++	 * COALESCE BY NAME. A UISlider emits a value-changed event per touch sample
++	 * — up to 120 a second on a ProMotion panel — and each one lands here. The
++	 * queue used to append and, once full, DROP THE NEWEST, which is the worst
++	 * possible policy: the values that survive are the first sixty-four of the
++	 * drag and the value the player actually let go on is thrown away. The cvar
++	 * ends up roughly where the slider started, which is indistinguishable from
++	 * a slider that does nothing at all. Brightness was diagnosed twice as a
++	 * renderer problem on the strength of that symptom.
++	 *
++	 * One slot per cvar makes overflow impossible in the case that matters: the
++	 * last write for a given name always wins, however fast they arrive, and a
++	 * drag of any length occupies exactly one entry.
++	 */
++	for ( int i = 0; i < s_cvarQueueCount; i++ ) {
++		if ( idStr::Icmp( s_cvarQueueName[i], name ) == 0 ) {
++			idStr::Copynz( s_cvarQueueValue[i], value, sizeof( s_cvarQueueValue[0] ) );
++			Sys_LeaveCriticalSection( CRITICAL_SECTION_ONE );
++			return;
++		}
++	}
++	if ( s_cvarQueueCount < OPENQ4_CVAR_QUEUE ) {
++		idStr::Copynz( s_cvarQueueName[ s_cvarQueueCount ], name, sizeof( s_cvarQueueName[0] ) );
++		idStr::Copynz( s_cvarQueueValue[ s_cvarQueueCount ], value, sizeof( s_cvarQueueValue[0] ) );
++		s_cvarQueueCount++;
++	} else {
++		// Distinct cvars only — the queue is now one slot per name, so filling
++		// it means something is writing more than 64 different cvars between
++		// two engine frames. Say so rather than dropping in silence.
++		s_cvarQueueOverflows++;
++	}
++	Sys_LeaveCriticalSection( CRITICAL_SECTION_ONE );
+ }
+ 
++/* Applied on the engine thread, where cvarSystem is safe to touch. */
++static void OpenQ4_iOS_DrainCvarQueue( void ) {
++	char names[OPENQ4_CVAR_QUEUE][64];
++	char values[OPENQ4_CVAR_QUEUE][64];
++	int  count = 0;
++	int  overflows = 0;
++
++	Sys_EnterCriticalSection( CRITICAL_SECTION_ONE );
++	count = s_cvarQueueCount;
++	for ( int i = 0; i < count; i++ ) {
++		idStr::Copynz( names[i], s_cvarQueueName[i], sizeof( names[0] ) );
++		idStr::Copynz( values[i], s_cvarQueueValue[i], sizeof( values[0] ) );
++	}
++	s_cvarQueueCount = 0;
++	overflows = s_cvarQueueOverflows;
++	s_cvarQueueOverflows = 0;
++	Sys_LeaveCriticalSection( CRITICAL_SECTION_ONE );
++
++	for ( int i = 0; i < count; i++ ) {
++		cvarSystem->SetCVarString( names[i], values[i] );
++	}
++	if ( overflows > 0 ) {
++		common->Warning( "iOS: dropped %i queued cvar write(s) — the shell queue was full", overflows );
++	}
++}
++
++extern "C" void OpenQ4_iOS_BridgeExecuteCommand( const char *text ) {
++	if ( text == NULL || text[0] == '\0' ) {
++		return;
++	}
++	idStr line = text;
++	line.Append( "\n" );
++	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, line.c_str() );
++}
++
++/*
++================
++OpenQ4_iOS_ServiceShellQueues
++
++Everything the UIKit shell hands to the engine, drained in one place on the
++ENGINE thread. Called both per frame and from Sys_GenerateEvents, so the
++engine's blocking inner loops (the map-load pacifier, the "press any key"
++gate) keep the buttons, the bridge and the settings alive instead of freezing
++them until the loop happens to end.
++
++All three are queue pops and therefore idempotent: calling this more often
++costs an uncontended lock and changes nothing else. Per-frame work that
++integrates over time — OpenQ4_iOS_TouchFrame — deliberately stays OUT, because
++running it twice in a frame would apply movement twice.
++================
++*/
++extern "C" void OpenQ4_iOS_ServiceShellQueues( void ) {
++	OpenQ4_iOS_BridgeDrain();
++	OpenQ4_iOS_DrainTouchButtons();
++	OpenQ4_iOS_DrainCvarQueue();
++}
++
++#if TARGET_OS_IPHONE
++/*
++================
++Deferred engine initialisation.
++
++common->Init() takes 15-20 seconds on this content: 22 retail paks, the decl
++system, and media. Running it inside UIApplicationMain's launch path means the
++app never signals "finished launching", and iOS's watchdog kills it at roughly
++20 seconds — which presents as a black screen followed by the app quitting, with
++no crash report attributable to us.
++
++So main() returns immediately after starting the display link, letting the launch
++complete, and the engine initialises on the FIRST frame tick instead. By then the
++launch window is closed and a long main-thread block is merely a long block.
++================
++*/
++static SDL_Window *OpenQ4_iOSFindWindow( void );   // defined below
++extern "C" int OpenQ4_iOS_AvailableMemoryMB( void );
++// openq4_ios_bridge.m: read-and-reset the display-link pacing counters
++extern "C" void OpenQ4_iOS_TakeFramePacingCounters( int *missed, int *catchUp, int *paceMode );
++// openq4_ios_mods.m: `+set` arguments the shell wants applied before the
++// filesystem builds its search paths — today only the mod picker's
++// `+set fs_game <dir>` (openQ4-ios D-080).
++extern "C" const char *const *OpenQ4_iOS_StartupArgs( int *outCount );
++
++static int   s_iosInitDone = 0;
++static int   s_iosInitArgc = 0;
++static char **s_iosInitArgv = NULL;
++
++static void OpenQ4_iOS_DeferredInit( void ) {
++	OpenQ4_iOS_SetBootStatus( "Loading Quake 4 data..." );
++	common->Printf( "iOS: memory headroom before init: %d MB\n", OpenQ4_iOS_AvailableMemoryMB() );
++
++	// common->Init() blocks this thread for 15-20 seconds, so the watchdog will
++	// correctly report main-alive as stalled throughout. Naming the phase is
++	// what separates "expected long block" from "wedged".
++	// Before common->Init(), because the sound system opens its device in
++	// there and the first activation is the one that cannot be fixed later.
++	// Without this the category defaults to one the ring/silent switch mutes,
++	// so the game is simply silent with no error reported anywhere.
++	OpenQ4_iOS_AudioSessionInit();
++	OpenQ4_iOS_MetricsInit();
++
++	/*
++	 * The bridge starts HERE, not after common->Init().
++	 *
++	 * It only opens a socket and tees stdout — it needs nothing from the engine,
++	 * and commands that arrive before cmdSystem exists simply queue. Starting it
++	 * afterwards meant the whole of init, fifteen to twenty seconds of the most
++	 * interesting output the app produces, was unreachable remotely and could
++	 * only be recovered from a log file the maintainer had to export by hand. The glyph
++	 * check below is the immediate case: its pre-init line is the one fact that
++	 * separates the candidate causes, and it was printed into a void.
++	 */
++	OpenQ4_iOS_BridgeStart();
++
++	// Before and after the big load, because when the UIKit glyph cache first
++	// fails is the fact that separates the candidate causes. See
++	// openq4_ios_fontcheck.h.
++	OpenQ4_iOS_FontCheck( "pre-init" );
++
++	OpenQ4_iOS_BlackBoxPhase( "common->Init (long block is expected here)" );
++
++	/*
++	 * The engine's startup arguments are the process's own argv PLUS whatever
++	 * the shell wants set before common->Init() (openQ4-ios D-080).
++	 *
++	 * A shipped iOS app has no command line at all — argv is a development
++	 * channel, driven by `simctl launch ... +set x y` — so the only way a
++	 * player can choose an fs_game is for the shell to supply it here. fs_game
++	 * is CVAR_INIT and FileSystem::Init builds its search paths inside this
++	 * call, which makes this the one moment in the process's life when a mod
++	 * can be selected.
++	 *
++	 * The shell's arguments go LAST so they win: NSUserDefaults is this port's
++	 * authority for a setting (the same rule that decides the SMAA default),
++	 * and a later `+set` overwrites an earlier one.
++	 */
++	static const int MAX_INIT_ARGS = 64;
++	const char *initArgv[ MAX_INIT_ARGS ];
++	int initArgc = 0;
++	for ( int i = 1; i < s_iosInitArgc && s_iosInitArgv != NULL && initArgc < MAX_INIT_ARGS; i++ ) {
++		initArgv[ initArgc++ ] = s_iosInitArgv[ i ];
++	}
++	int shellArgc = 0;
++	const char *const *shellArgv = OpenQ4_iOS_StartupArgs( &shellArgc );
++	for ( int i = 0; i < shellArgc && shellArgv != NULL && initArgc < MAX_INIT_ARGS; i++ ) {
++		initArgv[ initArgc++ ] = shellArgv[ i ];
++	}
++	if ( initArgc > 0 ) {
++		common->Init( initArgc, initArgv, NULL );
++	} else {
++		common->Init( 0, NULL, NULL );
++	}
++
++	OpenQ4_iOS_InitComplete();
++	OpenQ4_iOS_EngineReady();   // main may now pump SDL; the engine owned it until here
++	OpenQ4_iOS_BlackBoxPhase( "post-init" );
++	OpenQ4_iOS_FontCheck( "post-init" );
++	Sys_HandlePendingQuitSignal();
++	Posix_LateInit();
++
++	if ( OpenQ4_iOSFindWindow() == NULL ) {
++		common->FatalError( "iOS: no SDL window after common->Init()" );
++		return;
++	}
++
++	cmdSystem->AddCommand( "iosframelink", OpenQ4_iOS_FrameLinkCmd, CMD_FL_SYSTEM,
++			"report iOS display-link health (ticks, re-entrancy drops, link state)" );
++	cmdSystem->AddCommand( "iostouch", OpenQ4_iOS_TouchCmd, CMD_FL_SYSTEM,
++			"force the iOS touch overlay visible (1) or hidden (0)" );
++	cmdSystem->AddCommand( "iossettings", OpenQ4_iOS_SettingsCmd, CMD_FL_SYSTEM,
++			"open the iOS settings sheet" );
++
++	OpenQ4_iOS_SettingsApply();
++	OpenQ4_iOS_TouchSetup();
++
++	// The raw-AL partition tone lived here. It did its job — audible while the
++	// game was silent, which proved the session and backend were fine and put
++	// the fault in the engine mixer (it was my own settings bridge pushing
++	// s_volume 0). Audio works now, so it is gone; OpenQ4_iOS_AudioSelfTest is
++	// kept and can be called from the bridge if it is ever needed again.
++
++	OpenQ4_iOS_SetBootStatus( NULL );   // tears the boot overlay down
++	OpenQ4_iOS_BlackBoxPhase( "running" );
++	common->Printf( "iOS: engine initialised on the frame thread; running (%d MB headroom)\n",
++			OpenQ4_iOS_AvailableMemoryMB() );
++}
++#endif
++
++extern "C" void OpenQ4_iOS_EngineFrame( void ) {
++#if TARGET_OS_IPHONE
++	// Bumped before anything that can block, so a frozen counter means the main
++	// thread is stuck inside this call rather than never having reached it.
++	OpenQ4_iOS_NoteMainAlive();
++	// A normal frame means the map change is over; the load overlay can go.
++	OpenQ4_iOS_LoadProgressDone();
++	if ( !s_iosInitDone ) {
++		s_iosInitDone = 1;
++		OpenQ4_iOS_DeferredInit();
++		return;
++	}
++#endif
++
++	// Frame-loop heartbeat. A stalled display link and a running one are
++	// indistinguishable from a screenshot, and the engine prints nothing per
++	// frame, so without this "did frames stop, and when?" is unanswerable.
++	// Cheap: one clock read per frame, one line per five seconds.
++	{
++		static int		s_frames = 0;
++		static int		s_lastMs = 0;
++		static double	s_busyUs = 0.0;
++		static double	s_gapUs = 0.0;
++		static double	s_prevFrameEndTicks = 0.0;
++		const int		nowMs = Sys_Milliseconds();
++		s_frames++;
++
++		/*
++		 * Busy versus gap, because the first device pass could not tell them
++		 * apart and it is the question that matters.
++		 *
++		 * com_speeds accounts for ~3 ms of a ~15 ms frame (gfr + rf + bk) while
++		 * the display link is provably delivering a true 120 Hz, so either the
++		 * engine is BUSY for 15 ms in code none of those three timers cover, or
++		 * it is IDLE and something is pacing it down. Those need completely
++		 * different fixes and nothing shipped could distinguish them.
++		 *
++		 * busy = wall time inside common->Frame() and the shell servicing around
++		 * it; gap = everything else, which on this design is the wait for the
++		 * display link to signal the engine thread.
++		 */
++		const double clockTicksPerSecond = Sys_ClockTicksPerSecond();
++		const double frameStartTicks = Sys_GetClockTicks();
++		if ( s_prevFrameEndTicks > 0.0 && clockTicksPerSecond > 0.0 ) {
++			s_gapUs += ( frameStartTicks - s_prevFrameEndTicks ) * 1000000.0 / clockTicksPerSecond;
++		}
++		if ( s_lastMs == 0 ) {
++			s_lastMs = nowMs;
++		} else if ( nowMs - s_lastMs >= 5000 ) {
++			// Remaining Jetsam headroom rides every heartbeat. An OOM kill is a
++			// SIGKILL with no crash report, so without this a memory death is
++			// indistinguishable from any other sudden exit.
++			const int headroomMB = OpenQ4_iOS_AvailableMemoryMB();
++			char headroom[32];
++			if ( headroomMB < 0 ) {
++				idStr::snPrintf( headroom, sizeof( headroom ), "n/a" );
++			} else {
++				idStr::snPrintf( headroom, sizeof( headroom ), "%d MB", headroomMB );
++			}
++			// Pacing: how many display-link ticks landed on a frame that was
++			// still running, and how many of those the engine thread went on to
++			// serve immediately instead of idling to the following tick. A
++			// window with missed > 0 and catchup == 0 means catch-up is off.
++			int missedTicks = 0, catchUpFrames = 0, paceMode = 0;
++			OpenQ4_iOS_TakeFramePacingCounters( &missedTicks, &catchUpFrames, &paceMode );
++			common->Printf( "iOS heartbeat: %d frames in %d ms (%.1f fps), busy %.2f ms, gap %.2f ms, "
++					"pace %d, missed %d, catchup %d, thermal %s, %s memory headroom\n",
++					s_frames, nowMs - s_lastMs,
++					( nowMs > s_lastMs ) ? ( s_frames * 1000.0f / ( nowMs - s_lastMs ) ) : 0.0f,
++					( s_frames > 0 ) ? ( s_busyUs / s_frames / 1000.0 ) : 0.0,
++					( s_frames > 0 ) ? ( s_gapUs / s_frames / 1000.0 ) : 0.0,
++					paceMode, missedTicks, catchUpFrames,
++					OpenQ4_iOS_ThermalState(),
++					headroom );
++			s_frames = 0;
++			s_lastMs = nowMs;
++			s_busyUs = 0.0;
++			s_gapUs = 0.0;
++		}
++
++		OpenQ4_iOS_ServiceShellQueues();
++		OpenQ4_iOS_TouchFrame();
++		Sys_HandlePendingQuitSignal();
++		common->Frame();
++
++		const double frameEndTicks = Sys_GetClockTicks();
++		if ( clockTicksPerSecond > 0.0 ) {
++			s_busyUs += ( frameEndTicks - frameStartTicks ) * 1000000.0 / clockTicksPerSecond;
++		}
++		s_prevFrameEndTicks = frameEndTicks;
++	}
++}
++
++/*
++================
++OpenQ4_iOSFindWindow
++
++The renderer creates the window during common->Init(), behind the
++renderWindowServices_t seam, and the SDL3 backend keeps its handle file-static.
++Rather than patch an accessor into the backend, ask SDL for its window list -
++the engine is single-window, so the first entry is the game window.
++================
++*/
++static SDL_Window *OpenQ4_iOSFindWindow(void) {
++	int count = 0;
++	SDL_Window **windows = SDL_GetWindows(&count);
++	SDL_Window *window = (windows != NULL && count > 0) ? windows[0] : NULL;
++	SDL_free(windows);
++	return window;
++}
++#endif
++
++
+ static int SDLCALL OpenQ4_Main(int argc, char **argv) {
+ 	Posix_EarlyInit();
+-#ifndef ID_DEDICATED
++
++#if TARGET_OS_IPHONE
++	// Before common->Init(): the engine fatals when it cannot find retail data,
++	// and on iOS that fatal is both unreadable (no console) and unreliable
++	// (upstream #96), so a missing-data launch just looks like the app quitting.
++	// Import the data first, with a real UI.
++	OpenQ4_iOS_EnsureGameData();
++#endif
++#if !defined( ID_DEDICATED ) && !TARGET_OS_IPHONE
++	// No splash on iOS. UIKit permits exactly ONE window per display, and the
++	// splash takes it — the renderer's own SDL_CreateWindow then fails with
++	// "Only one window allowed per display." iOS shows its own launch screen
++	// from the app bundle anyway, so nothing is lost.
+ 	Sys_ShowSplash();
+ #endif
+ 
++#if TARGET_OS_IPHONE
++	// Do NOT initialise here — see OpenQ4_iOS_DeferredInit. Stash argv, start
++	// the display link, and return so the launch completes inside the watchdog's
++	// window.
++	s_iosInitArgc = argc;
++	s_iosInitArgv = argv;
++	OpenQ4_iOS_ShowBootOverlay();
++	OpenQ4_iOS_StartFrameLoop();
++	return 0;
++#else
+ 	if (argc > 1 && argv != NULL) {
+ 		common->Init(argc - 1, const_cast<const char **>(&argv[1]), NULL);
+ 	} else {
+ 		common->Init(0, NULL, NULL);
+ 	}
++#endif
+ 
+-#ifndef ID_DEDICATED
++#if !defined( ID_DEDICATED ) && !TARGET_OS_IPHONE
+ 	Sys_DestroySplash();
+ #endif
+ 	Sys_HandlePendingQuitSignal();
+ 	Posix_LateInit();
+ 
++#if TARGET_OS_IPHONE
++	return 0;   // unreachable; the iOS path returned above
++#else
+ 	while (1) {
+ 		Sys_HandlePendingQuitSignal();
+ 		common->Frame();
+ 	}
+ 
+ 	return 0;
++#endif
+ }
+ 
++/*
++================
++Entry point.
++
++Two shapes, one body.
++
++iOS is SDL-entry: main() hands off to SDL_RunApp, which calls
++UIApplicationMain, installs SDL's own app/scene delegate, and calls back into
++OpenQ4_Main once UIKit is up.
++
++visionOS is SwiftUI-entry (OPENQ4_SWIFT_MAIN, D-089). The app must be a SwiftUI
++@main to declare the ImmersiveSpace that Phase 6's stereo mode renders into, so
++UIApplicationMain has already run by the time the engine is reached and
++SDL_RunApp must not run at all. The shell calls SDL_SetMainReady() and then
++this function directly, off the scene that SwiftUI connected.
++
++The decision is made HERE, at bring-up, rather than deferred to the 3D phase:
++vkQuake D-028 found that flipping entry style over a bundle id that has already
++launched restores a persisted scene session naming SDL's scene delegate, which
++then calls through a NULL forward_main and dies at PC=0 with no usable report.
++The paired SDL patch (overlay/patches-sdl/swiftui) closes the same hole from
++SDL's side.
++================
++*/
++#if defined( OPENQ4_SWIFT_MAIN )
++extern "C" int openq4_engine_main(int argc, char **argv);
++extern "C" int openq4_engine_main(int argc, char **argv) {
++#else
+ int main(int argc, char **argv) {
++#endif
+ 	static char emptyArg0[] = "openQ4";
+ 	char *emptyArgv[] = { emptyArg0, NULL };
+ 	if (argc <= 0 || argv == NULL) {
+ 		argc = 1;
+ 		argv = emptyArgv;
+ 	}
++#if defined( OPENQ4_SWIFT_MAIN )
++	return OpenQ4_Main(argc, argv);
++#else
+ 	return SDL_RunApp(argc, argv, OpenQ4_Main, NULL);
++#endif
+ }

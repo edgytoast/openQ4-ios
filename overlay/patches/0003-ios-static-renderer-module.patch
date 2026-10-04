@@ -1,0 +1,107 @@
+--- a/src/renderer/RendererModule.cpp
++++ b/src/renderer/RendererModule.cpp
+@@ -21,7 +21,17 @@
+ // every build shape, including module-only clients that shed the static
+ // renderer sources
+ static const char *r_renderApiArgs[] = { "best", "gl", "vulkan", "gl-module", NULL };
+-idCVar r_renderApi( "r_renderApi", "gl", CVAR_RENDERER | CVAR_ARCHIVE, "rendering API: best = platform default (currently gl), gl = OpenGL renderer (loaded as the renderer-gl module on module-only builds, statically linked elsewhere), vulkan = native Vulkan renderer module (bring-up; falls back to gl), gl-module = alias that always selects the OpenGL module. Module selections take effect on engine restart.", r_renderApiArgs, idCmdSystem::ArgCompletion_String<r_renderApiArgs> );
++// iOS ships exactly one renderer. The GL backend needs a desktop compatibility
++// profile and ARB2 assembly programs from the retail paks, neither of which
++// exists on this platform, so "gl" is not a fallback there — it is a dead end.
++// Defaulting to vulkan makes the only working path the default one; a stale
++// archived "gl" in a user config would otherwise fatal at startup.
++#ifdef OPENQ4_RENDERER_MODULE_STATIC
++	#define OPENQ4_DEFAULT_RENDER_API "vulkan"
++#else
++	#define OPENQ4_DEFAULT_RENDER_API "gl"
++#endif
++idCVar r_renderApi( "r_renderApi", OPENQ4_DEFAULT_RENDER_API, CVAR_RENDERER | CVAR_ARCHIVE, "rendering API: best = platform default (currently gl), gl = OpenGL renderer (loaded as the renderer-gl module on module-only builds, statically linked elsewhere), vulkan = native Vulkan renderer module (bring-up; falls back to gl), gl-module = alias that always selects the OpenGL module. Module selections take effect on engine restart.", r_renderApiArgs, idCmdSystem::ArgCompletion_String<r_renderApiArgs> );
+ idCVar r_actualRenderApi( "r_actualRenderApi", "UNINITIALIZED", CVAR_RENDERER | CVAR_ROM, "rendering API actually active after request/fallback selection" );
+ 
+ // engine-side homes for window/gui cvars referenced by both the platform
+@@ -33,10 +43,16 @@
+ idCVar r_windowHeight( "r_windowHeight", "720", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "windowed mode height" );
+ idCVar r_skipGuiShaders( "r_skipGuiShaders", "0", CVAR_RENDERER | CVAR_INTEGER, "1 = skip all gui elements on surfaces, 2 = skip drawing but still handle events, 3 = draw but skip events", 0, 3, idCmdSystem::ArgCompletion_Integer<0,3> );
+ 
+-#ifdef OPENQ4_RENDERER_MODULE_ONLY
++#if defined( OPENQ4_RENDERER_MODULE_ONLY ) && !defined( OPENQ4_RENDERER_MODULE_STATIC )
+ // module-only clients have no renderer TUs; the engine-side interface
+ // globals live here, NULL until RM_PublishActiveModuleInterfaces fills them
+ // at first boot (before declManager->Init, so nothing dereferences earlier)
++//
++// OPENQ4_RENDERER_MODULE_STATIC is the iOS shape: module-only in structure (no
++// built-in GL renderer) but with the renderer linked into the same binary
++// rather than dlopen'd, because iOS cannot load unsigned code. The renderer's
++// own translation units then define these globals, so defining them here as
++// well is a duplicate-symbol link error.
+ idRenderSystem *		renderSystem = NULL;
+ idRenderModelManager *	renderModelManager = NULL;
+ #endif
+@@ -497,6 +513,13 @@
+ candidate is now the active renderer path.
+ ====================
+ */
++#ifdef OPENQ4_RENDERER_MODULE_STATIC
++// Declared, not dlsym'd: with the renderer linked into the same binary the
++// module's entry point is an ordinary external symbol. Matches the definition
++// in RendererGLModule.cpp.
++extern "C" renderExport_t *GetRenderAPI( renderImport_t *moduleImport );
++#endif
++
+ static bool RM_TryLoadModuleApi( rendererModuleApi_t api, rendererModuleStatus_t &status ) {
+ #ifndef OPENQ4_RENDERER_MODULE_ONLY
+ 	if ( api == RENDER_MODULE_API_GL ) {
+@@ -528,6 +551,18 @@
+ 	}
+ 	idStr::Copynz( status.modulePath, modulePath, sizeof( status.modulePath ) );
+ 
++#ifdef OPENQ4_RENDERER_MODULE_STATIC
++	// iOS links the renderer into the app binary: there is no dylib to dlopen,
++	// because the platform will not load unsigned code. The entry point is the
++	// same one the module would have exported (RendererGLModule.cpp), resolved
++	// at link time instead of by name.
++	//
++	// handle stays 0 throughout; every Sys_DLL_Unload below is skipped for it,
++	// so the unload paths remain correct without further edits.
++	common->Printf( "Renderer module: api='%s' (statically linked)\n", R_RendererModule_ApiName( api ) );
++	intptr_t handle = 0;
++	GetRenderAPI_t GetRenderAPI = &::GetRenderAPI;
++#else
+ 	common->Printf( "Loading renderer module: api='%s' path='%s'\n", R_RendererModule_ApiName( api ), modulePath );
+ 	intptr_t handle = Sys_DLL_Load( modulePath );
+ 	if ( handle == 0 ) {
+@@ -543,6 +578,7 @@
+ 		RM_AppendFallbackReason( status, "missing GetRenderAPI entry point" );
+ 		return false;
+ 	}
++#endif
+ 
+ 	renderImport_t moduleImport;
+ 	RM_BuildImport( moduleImport );
+@@ -588,7 +624,26 @@
+ 		return;
+ 	}
+ 
++#ifdef OPENQ4_RENDERER_MODULE_STATIC
++	// The one-shot activation window exists because a dlopen'd module would be
++	// unloaded and re-loaded here, leaving module-side static cvars whose
++	// completion callbacks dangle in the engine's cvar system. Statically
++	// linked there is no load and no unload: GetRenderAPI is an ordinary call
++	// into code that never leaves the address space, and RegisterStaticVars on
++	// this shape walks the ENGINE's own (already-consumed) static-cvar chain,
++	// so a second activation is a no-op rather than a dangling registration.
++	//
++	// This gate has to open, because a game-module swap (game_sp -> game_mp,
++	// which is what starting an Arena match does) tears the renderer down
++	// through idRenderSystemLocal::Shutdown and then re-boots it inside
++	// InitGame. With the gate shut that re-boot hit the FatalError below and
++	// the process died — the second half of the Arena crash (D-078). iOS ships
++	// exactly one renderer, so there is no candidate to choose between and
++	// nothing for a re-activation to get wrong.
++	rm_state.activationAllowed = true;
++#else
+ 	rm_state.activationAllowed = !rm_state.everBooted;
++#endif
+ 	rm_state.everBooted = true;
+ 
+ 	RM_UnloadModule();

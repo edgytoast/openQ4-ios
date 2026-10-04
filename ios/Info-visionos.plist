@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  openQ4 — visionOS. D-090.
+
+  Deliberately a SEPARATE file from ios/Info.plist rather than the same one with
+  conditionals: the charter requires the iOS target stay byte-for-byte untouched
+  by Phase 5, and several of the iOS keys are actively wrong here.
+
+  What is NOT here, and why (each one is a trap someone has already hit):
+   - No UISupportedInterfaceOrientations. A visionOS window has no orientation.
+   - No UIRequiresFullScreen. visionOS windows are resizable by definition; the
+     shape is constrained from UIKit instead (OpenQ4HostViewController requests
+     uniform resizing).
+   - No CADisableMinimumFrameDurationOnPhone. That is an iPhone ProMotion gate
+     and means nothing on a compositor-driven display.
+   - No LSRequiresIPhoneOS, no UIRequiredDeviceCapabilities (arm64/metal): both
+     are iOS-family declarations and xrOS validation rejects or ignores them.
+   - No UIStatusBarHidden / UIViewControllerBasedStatusBarAppearance: there is
+     no status bar.
+
+  What IS here that iOS does not have:
+   - UIApplicationSceneManifest with UIApplicationSupportsMultipleScenes = true
+     INSIDE the dict. Outside it the key is silently ignored and the app gets a
+     single-scene lifecycle it did not ask for — and this app is SwiftUI-entry
+     (D-089), so it is scene-based by construction.
+   - CFBundleURLTypes for openq4:// . The iOS plist has never carried it (the
+     charter asks for it "from day one" and it is still outstanding there); it
+     goes in here because this file is new and the scheme is bundle-id scoped,
+     so declaring it on one target declares it for that target only.
+
+  Version keys are BUILD SETTINGS, as of D-091. They were literals (0.1.0 / 1)
+  in both plists while publish-ota.sh passed MARKETING_VERSION on the xcodebuild
+  command line — which a literal ignores, so every published build reported
+  0.1.0 build 1 inside its own bundle no matter what the hub said. SideStore
+  compares CFBundleShortVersionString. scripts/version-strings.sh is the one
+  derivation of both values, out of VERSION + DEV_ITERATION and the pin-derived
+  resource build; every lane passes both and asserts the built plist afterwards.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>openQ4</string>
+	<key>CFBundleDisplayName</key>
+	<string>openQ4</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!-- Required on visionOS in addition to the asset catalog: actool owns
+	     CFBundleIcons there, but the NAME still has to be declared. -->
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+	</dict>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+
+	<!-- Users supply their own retail q4base. Both keys are needed for the
+	     Files app to see and write into the app's Documents directory. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.rebelancap.openq4</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>openq4</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Present as insurance, not because we scan. SDL's HIDAPI backend opens a
+	     CBCentralManager to look for Steam Controllers, and the OS terminates an
+	     app that touches CoreBluetooth without these. Localised through the same
+	     InfoPlist.strings mechanism the iOS target uses (D-088). -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>openQ4 can connect to Bluetooth game controllers.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>openQ4 can connect to Bluetooth game controllers.</string>
+
+	<!-- The pad is the primary input device on visionOS, and without this the
+	     system treats it as a UI navigation device. -->
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+</dict>
+</plist>

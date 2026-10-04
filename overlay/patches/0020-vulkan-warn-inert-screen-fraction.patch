@@ -1,0 +1,104 @@
+--- a/src/renderer/RenderSystem.cpp
++++ b/src/renderer/RenderSystem.cpp
+@@ -1358,6 +1358,69 @@
+ 		postProcessSMAAQuality.Set( 0.0f, 0.10f, 8.0f, 2.0f );
+ 	}
+ 
++#if defined( OPENQ4_VISIONOS_3D )
++	/*
++	 * visionOS 3D: the 2D layer belongs to the PANEL, not to the window
++	 * (openQ4-ios D-102, docs/stereo-design.md §3).
++	 *
++	 * D-101 decoupled the eye extent from the window — glConfig.vidWidth/Height
++	 * are r_stereo3dWidth/Height while 3D is on — but it left the UI viewport
++	 * alone, and that rectangle is still the WINDOW's safe area in the WINDOW's
++	 * pixels (sdl3_backend.cpp's SDL3_SetUIViewport, polled into glConfig by
++	 * vk_Backend.cpp every present). Applied to a 1920x1080 panel it puts the
++	 * whole 2D composite in a sub-rect: idGuiModel::EmitFullScreen derives the
++	 * fullscreen 2D viewport from exactly these four numbers, so the HUD lands
++	 * at that sub-rect's bottom (mid-height on the panel) and the crosshair at
++	 * its centre (up and to the left of the panel's). That is precisely what
++	 * the maintainer saw on hardware in 0.1.0.60; on the simulator the window and the
++	 * panel happened to have the same aspect and it read as correct.
++	 *
++	 * In 3D there is no safe area to respect and nothing else on the target, so
++	 * the UI viewport is the whole frame. Both copies are written: glConfig for
++	 * the renderer (tr_guisurf, GuiModel, tr_fontTTF) and engineWindowState for
++	 * the UI layer (ui/DeviceContext.cpp's scaling, ui/RenderWindow.cpp's
++	 * in-world GUI hit mapping), which read different ones.
++	 *
++	 * The engineWindowState values are saved on the way in and restored on the
++	 * way out, because SDL only rewrites them on a window event and D-102 stops
++	 * resizing the window on entry — so without the restore, leaving 3D would
++	 * keep the 2D window laid out at the panel's extent until something moved
++	 * the window.
++	 */
++	{
++		extern bool R_Stereo_Enabled( void );
++		static bool	stereoUiOverride = false;
++		static int	savedUi[ 4 ] = { 0, 0, 0, 0 };
++		if ( R_Stereo_Enabled() ) {
++			if ( !stereoUiOverride ) {
++				savedUi[ 0 ] = engineWindowState.uiViewportX;
++				savedUi[ 1 ] = engineWindowState.uiViewportY;
++				savedUi[ 2 ] = engineWindowState.uiViewportWidth;
++				savedUi[ 3 ] = engineWindowState.uiViewportHeight;
++				stereoUiOverride = true;
++			}
++			glConfig.uiViewportX = 0;
++			glConfig.uiViewportY = 0;
++			glConfig.uiViewportWidth = windowWidth;
++			glConfig.uiViewportHeight = windowHeight;
++			engineWindowState.uiViewportX = 0;
++			engineWindowState.uiViewportY = 0;
++			engineWindowState.uiViewportWidth = windowWidth;
++			engineWindowState.uiViewportHeight = windowHeight;
++		} else if ( stereoUiOverride ) {
++			stereoUiOverride = false;
++			engineWindowState.uiViewportX = savedUi[ 0 ];
++			engineWindowState.uiViewportY = savedUi[ 1 ];
++			engineWindowState.uiViewportWidth = savedUi[ 2 ];
++			engineWindowState.uiViewportHeight = savedUi[ 3 ];
++			glConfig.uiViewportX = savedUi[ 0 ];
++			glConfig.uiViewportY = savedUi[ 1 ];
++			glConfig.uiViewportWidth = savedUi[ 2 ];
++			glConfig.uiViewportHeight = savedUi[ 3 ];
++		}
++	}
++#endif
++
+ 	// Keep the 2D viewport anchored to a valid region of the current framebuffer.
+ 	// Platform backends can narrow this to a monitor sub-rect (top-left origin).
+ 	if ( glConfig.uiViewportWidth <= 0 || glConfig.uiViewportHeight <= 0 ) {
+@@ -1419,7 +1482,31 @@
+ 		CropRenderSize( w, h );
+ 	}
+ 
++	// ...and every other combination of those two cvars is implemented in the
++	// GL back end alone. draw_common.cpp owns both the sub-native upscale
++	// (modes 1 and 2) and the supersampling resolve; nothing under
++	// renderer/Vulkan reads either cvar. Under any other back end the frame
++	// therefore renders at full resolution and the cvars are silently inert,
++	// which reads exactly like a resolution control that does not work.
++	//
++	// Warned once per process, not per frame: this is a configuration mistake,
++	// and a per-frame warning would bury the log it belongs in.
++	{
++		static bool inertScreenFractionWarned = false;
++		if ( !inertScreenFractionWarned && screenFraction != 100
++				&& r_resolutionScaleMode.GetInteger() != 0 ) {
++			const char *api = cvarSystem->GetCVarString( "r_actualRenderApi" );
++			if ( api != NULL && idStr::Icmp( api, "gl" ) != 0
++					&& idStr::Icmp( api, "UNINITIALIZED" ) != 0 ) {
++				inertScreenFractionWarned = true;
++				common->Warning( "%s renderer: r_screenFraction %d with r_resolutionScaleMode %d "
++						"is not implemented; the frame renders at full resolution",
++						api, screenFraction, r_resolutionScaleMode.GetInteger() );
++			}
++		}
++	}
+ 
++
+ 	// this is the ONLY place this is modified
+ 	frameCount++;
+ 	R_RendererMetrics_BeginFrame( frameCount );

@@ -1,0 +1,36 @@
+--- a/src/sys/sys_public.h
++++ b/src/sys/sys_public.h
+@@ -81,6 +81,10 @@
+ #if defined(MACOS_X) || defined(__APPLE__)
+ 
+ #define BUILD_OS_ID					1
++// TARGET_OS_* is what separates the four Apple platforms; without it every
++// arm64 Apple build calls itself macos-arm64, and the startup banner -- the
++// first line of every log anyone sends in -- names the wrong platform.
++#include <TargetConditionals.h>
+ #ifdef __ppc__
+ 	#define	BUILD_STRING				"macos-ppc"
+ 	#define	CPUSTRING					"ppc"
+@@ -94,7 +98,21 @@
+ 	#define	CPUSTRING					"x64"
+ 	#define CPU_EASYARGS				1
+ #elif defined(__aarch64__) || defined(__arm64__)
+-	#define	BUILD_STRING				"macos-arm64"
++	#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
++		#if defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR
++			#define	BUILD_STRING		"visionos-sim-arm64"
++		#else
++			#define	BUILD_STRING		"visionos-arm64"
++		#endif
++	#elif defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++		#if defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR
++			#define	BUILD_STRING		"ios-sim-arm64"
++		#else
++			#define	BUILD_STRING		"ios-arm64"
++		#endif
++	#else
++		#define	BUILD_STRING			"macos-arm64"
++	#endif
+ 	#define	CPUSTRING					"arm64"
+ 	#define CPU_EASYARGS				1
+ #else

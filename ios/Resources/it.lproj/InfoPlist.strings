@@ -1,0 +1,8 @@
+/*
+ * InfoPlist.strings (it) — the Bluetooth purpose string iOS shows in the
+ * permission alert, machine-translated (D-112). "Manette" / "controller" /
+ * "mando" follow pak0's own word for a game controller (#str_229925; Spanish
+ * pak0 says "Controlador", but iOS's own Spanish UI says "mando" for a game pad).
+ */
+"NSBluetoothAlwaysUsageDescription" = "openQ4 può collegarsi ai controller di gioco Bluetooth.";
+"NSBluetoothPeripheralUsageDescription" = "openQ4 può collegarsi ai controller di gioco Bluetooth.";

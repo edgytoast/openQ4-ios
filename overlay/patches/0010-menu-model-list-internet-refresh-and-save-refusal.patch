@@ -1,0 +1,228 @@
+--- a/src/framework/Session_menu.cpp
++++ b/src/framework/Session_menu.cpp
+@@ -1295,7 +1295,16 @@
+ 
+ 	const int numModels = declManager->GetNumDecls( DECL_PLAYER_MODEL );
+ 	for ( int i = 0; i < numModels; ++i ) {
+-		const rvDeclPlayerModel *playerModel = static_cast<const rvDeclPlayerModel *>( declManager->DeclByIndex( DECL_PLAYER_MODEL, i, true ) );
++		// forceParse=false: this list needs only each model's name and display
++		// name. Forcing a parse runs rvDeclPlayerModel's CacheMedia, which walks
++		// the transitive entityDef media closure — heads, weapons, skins, gore
++		// effects — i.e. building the main menu drags in most of the game's
++		// texture set. Measured on an A19 Pro: 47 of the 70 seconds of startup.
++		//
++		// It is also loaded OUTSIDE level load, so each image is loaded
++		// synchronously on the spot rather than batched at EndLevelLoad, and is
++		// flagged referencedOutsideLevelLoad and never purged.
++		const rvDeclPlayerModel *playerModel = static_cast<const rvDeclPlayerModel *>( declManager->DeclByIndex( DECL_PLAYER_MODEL, i, false ) );
+ 		if ( !playerModel ) {
+ 			continue;
+ 		}
+@@ -1314,6 +1323,32 @@
+ 	}
+ }
+ 
++/*
++==============
++MainMenuReadEntityDefWithoutMedia
++
++Copies an entityDef's key/values without precaching the media they name (see
++SetMainMenuMPModelVars). Only for defs with no "inherit" key: a noCaching parse
++also parses inherited defs without caching, and only the named decl is returned
++to the unparsed state here. player_marine_mp_ui inherits nothing in every
++retail pak that defines it (pak001/015/017/020/022).
++==============
++*/
++static bool MainMenuReadEntityDefWithoutMedia( const char *name, idDict &out ) {
++	out.Clear();
++	const idDecl *before = declManager->FindDeclWithoutParsing( DECL_ENTITYDEF, name, false );
++	const bool wasParsed = before != NULL && before->GetState() != DS_UNPARSED;
++	const idDecl *decl = declManager->FindType( DECL_ENTITYDEF, name, false, true );
++	if ( decl == NULL ) {
++		return false;
++	}
++	out = static_cast<const idDeclEntityDef *>( decl )->dict;
++	if ( !wasParsed && decl->GetState() != DS_UNPARSED ) {
++		const_cast<idDecl *>( decl )->Invalidate();
++	}
++	return true;
++}
++
+ static void SetMainMenuMPModelVars( idUserInterface *gui ) {
+ 	if ( !gui ) {
+ 		return;
+@@ -1323,9 +1358,37 @@
+ 	const int menuModelTeam = MainMenuResolveModelTeam();
+ 	MainMenuSyncMPSettingsGuiState( gui, menuModelTeam );
+ 
+-	const idDeclEntityDef *menuDef = static_cast<const idDeclEntityDef *>( declManager->FindType( DECL_ENTITYDEF, "player_marine_mp_ui", false ) );
+-	const idDeclEntityDef *fallbackDef = static_cast<const idDeclEntityDef *>( declManager->FindType( DECL_ENTITYDEF, "player_marine_mp", false ) );
+-	const idDeclEntityDef *def = menuDef ? menuDef : fallbackDef;
++	// Only a handful of strings are read from the player def below (the
++	// default model names and the fallback model/head/skin), but parsing an
++	// entityDef with caching runs CacheDictionaryMedia over it: MD5 meshes,
++	// animations, materials, images and BSE effects for the whole multiplayer
++	// player, loaded synchronously outside level load before the menu can
++	// draw. Measured 3.4-3.7 s of every launch on the simulator (D-108).
++	//
++	// So read the dict with caching suppressed (retail resolved this def the
++	// same way), copy the strings out, and if THIS lookup was what parsed the
++	// decl, return it to unparsed: the game resolves player_marine_mp_ui /
++	// player_marine_mp with caching during a level load, and a decl parsed
++	// here would otherwise stay parsed-without-media for the session (decls
++	// parsed outside a level load are never purged). The one model the
++	// preview shows is still cached on demand by MainMenuExtractPlayerModelInfo
++	// and the head lookup in MainMenuApplyPlayerModelPreview.
++	//
++	// The fallback is resolved only when the _ui def is missing, as upstream
++	// 3b89948 does, and still with caching (see below).
++	idDict defDict;
++	bool haveDef = MainMenuReadEntityDefWithoutMedia( "player_marine_mp_ui", defDict );
++	if ( !haveDef ) {
++		// player_marine_mp inherits player_marine, which a noCaching parse
++		// would also leave parsed without media; this path is not taken with
++		// retail 1.4.2 data, so it keeps the caching lookup.
++		const idDeclEntityDef *fallbackDef = static_cast<const idDeclEntityDef *>( declManager->FindType( DECL_ENTITYDEF, "player_marine_mp", false ) );
++		if ( fallbackDef != NULL ) {
++			defDict = fallbackDef->dict;
++			haveDef = true;
++		}
++	}
++	const idDict *def = haveDef ? &defDict : NULL;
+ 
+ 	idStr buildValues;
+ 	idStr buildNames;
+@@ -1339,9 +1402,9 @@
+ 	const char *selectedModelDecl = cvarSystem->GetCVarString( modelCVar.c_str() );
+ 	if ( ( !selectedModelDecl || !selectedModelDecl[0] ) && def ) {
+ 		if ( menuModelTeam >= 0 && menuModelTeam < 2 ) {
+-			selectedModelDecl = def->dict.GetString( va( "def_default_model_%s", mainMenuMPTeamNames[ menuModelTeam ] ) );
++			selectedModelDecl = def->GetString( va( "def_default_model_%s", mainMenuMPTeamNames[ menuModelTeam ] ) );
+ 		} else {
+-			selectedModelDecl = def->dict.GetString( "def_default_model" );
++			selectedModelDecl = def->GetString( "def_default_model" );
+ 		}
+ 	}
+ 
+@@ -1362,12 +1425,12 @@
+ 	}
+ 
+ 	if ( !selectedModelName.Length() && def ) {
+-		selectedModelName = def->dict.GetString( "model" );
+-		selectedHeadName = def->dict.GetString( "def_head_ui" );
++		selectedModelName = def->GetString( "model" );
++		selectedHeadName = def->GetString( "def_head_ui" );
+ 		if ( !selectedHeadName.Length() ) {
+-			selectedHeadName = def->dict.GetString( "def_head" );
++			selectedHeadName = def->GetString( "def_head" );
+ 		}
+-		selectedSkinName = def->dict.GetString( "skin" );
++		selectedSkinName = def->GetString( "skin" );
+ 	}
+ 
+ 	if ( selectedModelName.Length() || selectedHeadName.Length() || selectedSkinName.Length() ) {
+@@ -1779,6 +1842,13 @@
+ 	fileSystem->CloseFile( file );
+ 	return valid;
+ }
++
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++// D-114, Session.cpp / openq4_ios_loc.m.
++int Session_iOS_ProbeSaveGame( const char *slotName, idStr *mapOut, idStr *entityFilterOut, idDict *playerInfoOut );
++void Session_iOS_ExplainLoadRefusal( const char *slotName );
++extern "C" const char *OpenQ4_iOS_SaveText( int which );
++#endif
+ 
+ static bool Session_MenuReadSaveDescription( const idStr &slotName, sessionMenuSaveDescription_t &description ) {
+ 	description.saveName.Clear();
+@@ -1921,7 +1991,38 @@
+ 		return;
+ 	}
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	/*
++	 * Give the field a usable name up front instead of an empty string.
++	 *
++	 * HandleSaveGameMenuCommand does nothing at all — silently — when
++	 * saveGameName is empty, so on a device the Save button appears broken
++	 * whenever the on-screen keyboard has not produced any text. That made Save
++	 * hostage to iOS keyboard plumbing, which is exactly the sort of dependency
++	 * worth removing rather than perfecting: typing is now optional polish, and
++	 * a player who just wants to save can press Save and get a save.
++	 *
++	 * The map name plus the clock keeps successive saves distinct and sorts
++	 * sensibly in the list.
++	 */
++	{
++		idStr defaultName = mapSpawnData.serverInfo.GetString( "si_map" );
++		defaultName.StripPath();
++		defaultName.StripFileExtension();
++		if ( defaultName.IsEmpty() ) {
++			defaultName = "save";
++		}
++		time_t now;
++		time( &now );
++		struct tm *t = localtime( &now );
++		if ( t != NULL ) {
++			defaultName += va( " %02d-%02d %02d%02d", t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min );
++		}
++		guiActive->SetStateString( "saveGameName", defaultName.c_str() );
++	}
++#else
+ 	guiActive->SetStateString( "saveGameName", "" );
++#endif
+ 	guiActive->SetStateString( "saveGameDescription", "" );
+ 	guiActive->SetStateString( "saveGameDate", "" );
+ 	guiActive->SetStateString( "saveGameTime", "" );
+@@ -1938,6 +2039,16 @@
+ 		} else {
+ 			name = loadGameList[i];
+ 		}
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++		// D-114: a save this build cannot restore says so in the list itself,
++		// instead of looking like every other row until it is picked.
++		{
++			const int verdict = Session_iOS_ProbeSaveGame( loadGameList[i].c_str(), NULL, NULL, NULL );
++			if ( verdict == 1 || verdict == 2 ) {
++				name = va( "^8[%s]^0 %s", OpenQ4_iOS_SaveText( 0 ), name.c_str() );
++			}
++		}
++#endif
+ 
+ 		guiActive->SetStateString( va("loadgame_item_%i", i), name);
+ 	}
+@@ -2136,7 +2247,18 @@
+ 	if ( !idStr::Icmp( cmd, "loadGame" ) ) {
+ 		int choice = guiActive->State().GetInt("loadgame_sel_0");
+ 		if ( choice >= 0 && choice < loadGameList.Num() ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++			// D-114: ask before loading. A save this build will refuse used to
++			// do nothing at all here (or, from the multiplayer module, swap the
++			// whole game module first and then drop the player at the menu);
++			// now it never starts a load and the player is told why.
++			if ( Session_iOS_ProbeSaveGame( loadGameList[choice].c_str(), NULL, NULL, NULL ) != 0
++					|| !sessLocal.LoadGame( loadGameList[choice] ) ) {
++				Session_iOS_ExplainLoadRefusal( loadGameList[choice].c_str() );
++			}
++#else
+ 			sessLocal.LoadGame( loadGameList[choice] );
++#endif
+ 		}
+ 		return true;
+ 	}
+@@ -2580,7 +2702,14 @@
+ 			if ( guiActive->State().GetBool( "lanSet" ) ) {
+ 				cmdSystem->BufferCommandText( CMD_EXEC_NOW, "LANScan" );
+ 			} else {
+-				idAsyncNetwork::client.serverList.NetScan( );
++				// openQ4-ios overlay (upstreaming candidate): re-ask the master.
++				// NetScan() only re-pings the addresses already stored, so
++				// Refresh on the Internet tab could never discover a server
++				// that came up after the tab was opened — and, worse, it was
++				// the only button a user would press after a failed first
++				// query, when the stored list is empty and re-pinging nothing
++				// is a no-op. GetNETServers() clears, re-queries and re-pings.
++				idAsyncNetwork::GetNETServers();
+ 			}
+ 			continue;
+ 		}

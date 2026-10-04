@@ -1,0 +1,72 @@
+--- a/src/framework/DeclManager.cpp
++++ b/src/framework/DeclManager.cpp
+@@ -30,6 +30,12 @@
+ 
+ 
+ // jmarshall - Raven Decl Support
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++extern "C" void OpenQ4_iOS_SetActivity( const char *what );
++#endif
++#endif
+ #include "../bse/BSE_API.h"
+ // jmarshall end
+ 
+@@ -2361,6 +2367,20 @@
+ =================
+ */
+ const idDecl *idDeclManagerLocal::FindType( declType_t type, const char *name, bool makeDefault, bool noCaching) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Names what is being loaded RIGHT NOW for the 1 Hz black-box sampler. The
++	// map load dies at the same point every run — same memory consumed, same
++	// progress count, across builds with quite different code — so the thing
++	// that matters is WHICH asset it is on, and nothing in this path prints.
++	{
++		const char *openq4_what = ( name );
++		if ( openq4_what != NULL && openq4_what[0] != '\0' ) {
++			char openq4_act[192];
++			idStr::snPrintf( openq4_act, sizeof( openq4_act ), "decl: %s", openq4_what );
++			OpenQ4_iOS_SetActivity( openq4_act );
++		}
++	}
++#endif
+ 	idDeclLocal *decl;
+ 
+ 	if ( !name || !name[0] ) {
+--- a/src/renderer/ModelManager.cpp
++++ b/src/renderer/ModelManager.cpp
+@@ -29,6 +29,12 @@
+ 
+ 
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++extern "C" void OpenQ4_iOS_SetActivity( const char *what );
++#endif
++#endif
+ #include "Model_local.h"
+ #include "tr_local.h"	// just for R_FreeWorldInteractions and R_CreateWorldInteractions
+ 
+@@ -395,6 +401,20 @@
+ =================
+ */
+ idRenderModel *idRenderModelManagerLocal::GetModel( const char *modelName, bool createIfNotFound ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Names what is being loaded RIGHT NOW for the 1 Hz black-box sampler. The
++	// map load dies at the same point every run — same memory consumed, same
++	// progress count, across builds with quite different code — so the thing
++	// that matters is WHICH asset it is on, and nothing in this path prints.
++	{
++		const char *openq4_what = ( modelName );
++		if ( openq4_what != NULL && openq4_what[0] != '\0' ) {
++			char openq4_act[192];
++			idStr::snPrintf( openq4_act, sizeof( openq4_act ), "model: %s", openq4_what );
++			OpenQ4_iOS_SetActivity( openq4_act );
++		}
++	}
++#endif
+ 	idStr		canonical;
+ 	idStr		extension;
+ 	idStr		md5rName;

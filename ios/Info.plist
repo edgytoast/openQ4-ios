@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>openQ4</string>
+	<key>CFBundleDisplayName</key>
+	<string>openQ4</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+
+	<!-- Landscape only. The renderer is initialised against the drawable it
+	     first sees, so the app must not be able to start in portrait. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- openq4:// deep links (D-096). Shape and CFBundleURLName match
+	     Info-visionos.plist exactly; the scheme is registered per target, so
+	     declaring it there never declared it here. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.rebelancap.openq4</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>openq4</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Users supply their own retail q4base. Both keys are needed for the
+	     Files app to see and write into the app's Documents directory. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<!-- Required to exceed 60 Hz on a ProMotion panel at all; without it iOS
+	     caps the display link regardless of the requested frame-rate range. -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<string>metal</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<true/>
+	<!-- Declares that the game drives its own controller input. Without it iOS
+	     treats a paired pad as a system-UI navigation device and the engine
+	     never sees the presses. -->
+	<!-- Present as insurance, not because we scan. SDL's iOS HIDAPI backend
+	     opens a CBCentralManager to look for Steam Controllers, and iOS
+	     terminates an app that touches CoreBluetooth without this key — which
+	     is what killed every device build before 0.1.0.9. HIDAPI is now off on
+	     iOS, so nothing should reach CoreBluetooth at all; if something ever
+	     does, it must prompt rather than abort. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>openQ4 can connect to Bluetooth game controllers.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>openQ4 can connect to Bluetooth game controllers.</string>
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+	<key>GCSupportsMultipleMicroGamepads</key>
+	<false/>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>

@@ -1,0 +1,50 @@
+--- a/src/sys/posix/posix_main.cpp
++++ b/src/sys/posix/posix_main.cpp
+@@ -150,7 +150,21 @@
+ Posix_Exit
+ ================
+ */
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++extern "C" void OpenQ4_iOS_BlackBox( const char *fmt, ... ) __attribute__((format(printf, 1, 2)));
++extern "C" void OpenQ4_iOS_ServiceShellQueues( void );
++#endif
++#endif
++
+ void Posix_Exit(int ret) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// The last thing the process does on a deliberate exit. Without this, an
++	// engine-initiated quit and an OS kill look identical from the logs: both
++	// simply stop.
++	OpenQ4_iOS_BlackBox( "*** Posix_Exit(%d) — engine-initiated shutdown ***", ret );
++#endif
+ 	if ( !Posix_IsMainThread() ) {
+ 		// A worker-thread fatal error exits through here. Joining the async
+ 		// thread from itself would recurse through common->Error until the
+@@ -1472,6 +1486,25 @@
+ void Sys_GenerateEvents( void ) {
+ 	char *s;
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	/*
++	 * Service the shell's cross-thread queues here rather than only in the
++	 * per-frame entry point, because the engine has blocking inner loops that
++	 * render and pump for as long as they like without ever returning to it —
++	 * the map-load pacifier, and the "press any key to continue" gate, which
++	 * waits on input indefinitely.
++	 *
++	 * While one of those is up, the frame function is not running, so the
++	 * bridge, the touch buttons and the settings bridge were all frozen: an
++	 * on-screen button did nothing, a console command sent over the bridge sat
++	 * in its queue until the gate was dismissed by hand, and a settings change
++	 * did not apply. Sys_GenerateEvents is the one place every such loop calls,
++	 * and it is always the engine thread — which is exactly where these drains
++	 * must run.
++	 */
++	OpenQ4_iOS_ServiceShellQueues();
++#endif
++
+ #if defined( USE_SDL3 )
+ 	(void)Sys_SDL_PumpEvents();
+ 	IN_Frame();

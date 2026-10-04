@@ -1,0 +1,356 @@
+--- a/src/framework/UsercmdGen.cpp
++++ b/src/framework/UsercmdGen.cpp
+@@ -32,6 +32,13 @@
+ #include "Session_local.h"
+ #include "../idlib/NumericString.h"
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include <atomic>
++#endif
++#endif
++
+ static const float MOUSE_CPI_INCHES_PER_CM = 2.5399999618530273f;
+ static const float MOUSE_CPI_VIEW_SCALE = 45.45454545454546f;
+ static const int MOUSE_FILTER_SAMPLES = 32;
+@@ -386,6 +393,13 @@
+ 	void			KeyMove( void );
+ 	void			JoystickMove( void );
+ 	void			MouseMove( void );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	void			TouchLook( bool apply );
++	void			TouchMove( bool apply );
++public:
++	void			TouchButton( int action, bool down );
++private:
++#endif
+ 	float			NormalizeMouseDeltasForCpi( float &mx, float &my, float &strafeMx, float &strafeMy ) const;
+ 	float			CalculateMouseSensitivity( float mx, float my, float *debugRate, float *debugPower ) const;
+ 	float			GetZoomLookSensitivityScale( void ) const;
+@@ -469,6 +483,32 @@
+ idCVar idUsercmdGenLocal::in_angleSpeedKey( "in_anglespeedkey", "1.5", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT, "angle change scale when holding down _speed button" );
+ idCVar idUsercmdGenLocal::in_freeLook( "in_freeLook", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "look around with mouse (reverse _mlook button)" );
+ idCVar idUsercmdGenLocal::in_alwaysRun( "in_alwaysRun", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "always run (reverse _speed button)" );
++/*
++ * Gamepad weapon-wheel speed, as a multiplier on the base 14 counts per tic.
++ *
++ * A slider while the maintainer finds the number, exactly as the touch wheel was done —
++ * that took one round and the value it produced (0.85) is now a constant. This
++ * is deliberately a cvar and not a shell-only setting because the wheel code
++ * that consumes it lives here in the usercmd generator, not in the shell.
++ */
++idCVar in_padWheelSpeed( "in_padWheelSpeed", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT,
++		"weapon-wheel cursor speed for a gamepad stick, as a multiple of the default", 0.25f, 4.0f );
++/*
++ * Per-axis gamepad look scale (openQ4-ios D-109).
++ *
++ * The iOS/visionOS settings sheet's "Look Sensitivity (Horizontal/Vertical)"
++ * sliders drove only the touch look path, so on a Vision Pro with a pad they
++ * moved and nothing happened. quake3e-ios scales its touch AND pad look from the
++ * same two sliders (ios/shell/ios_input.m:514-515, ios_settings.m:295-299); the
++ * shell now pushes them here. Multiplies in_joystickLookSensitivity rather than
++ * replacing it, so a profile or archived value of that cvar keeps its meaning
++ * and the defaults (1.0) change nothing for any other platform.
++ */
++idCVar in_padLookScaleX( "in_padLookScaleX", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT,
++		"gamepad look speed multiplier, horizontal (yaw)", 0.1f, 4.0f );
++idCVar in_padLookScaleY( "in_padLookScaleY", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_FLOAT,
++		"gamepad look speed multiplier, vertical (pitch)", 0.1f, 4.0f );
++
+ static idCVar in_runDefaultMigrated( "in_runDefaultMigrated", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "one-time migration flag for legacy openQ4 run defaults" );
+ idCVar idUsercmdGenLocal::in_toggleRun( "in_toggleRun", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "pressing _speed button toggles run on/off - only in MP" );
+ idCVar idUsercmdGenLocal::in_toggleCrouch( "in_toggleCrouch", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "pressing _movedown button toggles player crouching/standing" );
+@@ -1052,8 +1092,155 @@
+ 	EndMouseFilter();
+ }
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++
+ /*
++=================
++Touch look
++
++Touch look is expressed in absolute view degrees and applied straight to
++viewangles, deliberately bypassing MouseMove() entirely.
++
++Routing glass through the mouse path would make the shell's "look sensitivity"
++slider mean a different thing at every value of sensitivity, m_yaw, m_pitch,
++m_cpi and cl_mouseAccel — a user who had adjusted their mouse settings would
++find their touch slider silently recalibrated. It would also inherit the mouse
++filter, which smooths for a device with physical inertia that a fingertip on
++glass does not have, and it quantised to whole mouse counts, so slow drags lost
++motion outright to integer truncation.
++
++The accumulator is atomic because touch events arrive on the main thread at
++display-link rate while usercmds are generated on the tic clock, and it
++accumulates rather than overwrites so that every touch sample inside one 60 Hz
++tic contributes instead of the last one winning.
+ =================
++*/
++static std::atomic<float> s_touchLookYaw( 0.0f );
++static std::atomic<float> s_touchLookPitch( 0.0f );
++
++// Touch movement, in normalised -1..1, applied directly to the usercmd.
++//
++// It does NOT go through the joystick axes, which is where it started and why
++// the on-screen stick did nothing: SDL3_UpdateGamepadAxes / ClearJoystickState
++// rewrite s_joystickAxisState on every pump, so anything injected there is
++// overwritten before the next usercmd is built. Look already worked precisely
++// because it was on this path.
++static std::atomic<float> s_touchMoveForward( 0.0f );
++static std::atomic<float> s_touchMoveRight( 0.0f );
++
++extern "C" void OpenQ4_iOS_SetTouchMove( float forward, float right ) {
++	s_touchMoveForward.store( forward, std::memory_order_relaxed );
++	s_touchMoveRight.store( right, std::memory_order_relaxed );
++}
++
++static void AccumulateAtomicFloat( std::atomic<float> &target, float delta ) {
++	float prev = target.load( std::memory_order_relaxed );
++	while ( !target.compare_exchange_weak( prev, prev + delta, std::memory_order_relaxed ) ) {
++		// compare_exchange_weak refreshes prev on failure
++	}
++}
++
++extern "C" void OpenQ4_iOS_AccumulateLook( float yawDegrees, float pitchDegrees ) {
++	AccumulateAtomicFloat( s_touchLookYaw, yawDegrees );
++	AccumulateAtomicFloat( s_touchLookPitch, pitchDegrees );
++}
++
++static bool IsWeaponSelectionImpulse( int action );
++
++/*
++ * Mirrors Key()'s button bookkeeping without the keyState table, which belongs
++ * to real keys. Impulses fire on the press edge exactly as they do there.
++ */
++void idUsercmdGenLocal::TouchButton( int action, bool down ) {
++	if ( action < 0 || action >= UB_MAX_BUTTONS ) {
++		return;
++	}
++	if ( down ) {
++		if ( action == UB_WEAPONWHEEL || IsWeaponSelectionImpulse( action ) ) {
++			toggled_zoom.Clear();
++		}
++		buttonState[ action ]++;
++		if ( !Inhibited() ) {
++			if ( action >= UB_IMPULSE0 && action <= UB_IMPULSE127 ) {
++				cmd.impulse = action - UB_IMPULSE0;
++				cmd.flags ^= UCF_IMPULSE_SEQUENCE;
++			}
++		}
++	} else {
++		buttonState[ action ]--;
++		if ( buttonState[ action ] < 0 ) {
++			buttonState[ action ] = 0;
++		}
++	}
++}
++
++/*
++ * Touch buttons, straight into the usercmd button state.
++ *
++ * They used to be buffered as "+attack"/"-attack" command text, which is not how
++ * this engine works at all: `_attack` and friends are usercmd ACTIONS, resolved
++ * from a bound key by idUsercmdGenLocal::Key() into buttonState[]. There is no
++ * "+attack" command, so every on-screen button was buffering a string the
++ * command system quietly discarded — the press registered (the haptic fired) and
++ * nothing happened.
++ *
++ * Setting the action directly also means the buttons do not depend on the player
++ * having some key bound to that action, which a touch-only device may not.
++ */
++extern "C" void OpenQ4_iOS_SetTouchButtonByName( const char *name, int down ) {
++	// The mapping lives here because the UB_* enum is local to this file, and
++	// the shell should be naming actions rather than knowing engine constants.
++	static const struct { const char *name; int action; } kTouchActions[] = {
++		{ "attack",     UB_ATTACK      },
++		{ "jump",       UB_UP          },
++		{ "crouch",     UB_DOWN        },
++		{ "reload",     UB_IMPULSE13   },
++		{ "weapnext",   UB_IMPULSE14   },
++		{ "weapwheel",  UB_WEAPONWHEEL },
++		{ "objectives", UB_IMPULSE19   },
++		{ "zoom",       UB_ZOOM        },
++		{ "speed",      UB_SPEED       },
++	};
++
++	if ( name == NULL ) {
++		return;
++	}
++	for ( int i = 0; i < (int)( sizeof( kTouchActions ) / sizeof( kTouchActions[0] ) ); i++ ) {
++		if ( idStr::Icmp( name, kTouchActions[i].name ) == 0 ) {
++			localUsercmdGen.TouchButton( kTouchActions[i].action, down != 0 );
++			return;
++		}
++	}
++}
++
++void idUsercmdGenLocal::TouchMove( bool apply ) {
++	const float forward = s_touchMoveForward.load( std::memory_order_relaxed );
++	const float right = s_touchMoveRight.load( std::memory_order_relaxed );
++	if ( !apply ) {
++		return;
++	}
++	// Held state, not a delta: the stick reports where the thumb is, and the
++	// value stands until the next report or the finger lifting (which posts 0).
++	cmd.forwardmove = idMath::ClampChar( cmd.forwardmove + (int)( forward * 127.0f ) );
++	cmd.rightmove = idMath::ClampChar( cmd.rightmove + (int)( right * 127.0f ) );
++}
++
++void idUsercmdGenLocal::TouchLook( bool apply ) {
++	// Always drain, even when discarding: a menu that banked up every stray
++	// touch would spin the view the moment it closed.
++	const float yaw = s_touchLookYaw.exchange( 0.0f, std::memory_order_relaxed );
++	const float pitch = s_touchLookPitch.exchange( 0.0f, std::memory_order_relaxed );
++	if ( !apply ) {
++		return;
++	}
++	viewangles[YAW] += yaw;
++	viewangles[PITCH] += pitch;
++}
++
++#endif	// __APPLE__ && TARGET_OS_IPHONE
++
++/*
++=================
+ idUsercmdGenLocal::JoystickMove
+ =================
+ */
+@@ -1087,11 +1274,50 @@
+ 	}
+ 	joystickLookSensitivity = idMath::ClampFloat( 0.1f, 4.0f, joystickLookSensitivity ) * GetZoomLookSensitivityScale();
+ 
+-	if ( hasDedicatedLookAxis || !ButtonState( UB_STRAFE ) ) {
++	if ( ButtonState( UB_WEAPONWHEEL ) ) {
++		/*
++		 * While the wheel is open the look stick steers the wheel CURSOR, not the
++		 * view — and it has to do it through the mouse counters.
++		 *
++		 * idPlayer::UpdateWeaponWheelCursor reads usercmd.mx/my deltas, and only
++		 * falls back to view-angle deltas when both are zero. A pad produced no
++		 * mouse counts, so it always took the fallback, and the fallback is wrong
++		 * twice over. It is mirrored: pushing the stick left turns the view left,
++		 * which INCREASES yaw, which moves the cursor right. And it is scaled for
++		 * a mouse flick — 0.08 cursor-units per degree against a 118-unit radius,
++		 * so crossing the wheel took several full turns of the view. Both of those
++		 * are exactly what the maintainer reported from hardware, and the vertical axis
++		 * escaped only because its two sign errors cancel.
++		 *
++		 * Feeding the stick in as mouse counts fixes the direction (positive is
++		 * right, chosen here rather than inherited) and the speed in one move, and
++		 * it puts the pad on the same path the touch wheel already uses.
++		 */
++		static float wheelRemainderX = 0.0f;
++		static float wheelRemainderY = 0.0f;
++		// Full deflection crosses the wheel's 118-unit radius in about a fifth of
++		// a second: 118 / 0.70 units-per-count / 12 tics is a shade over 14.
++		const float WHEEL_COUNTS_PER_TIC = 14.0f * idMath::ClampFloat( 0.25f, 4.0f, in_padWheelSpeed.GetFloat() );
++		wheelRemainderX += lookAxisX * WHEEL_COUNTS_PER_TIC;
++		wheelRemainderY += lookAxisY * WHEEL_COUNTS_PER_TIC;
++		// Whole counts only, remainder carried, so a small deflection still
++		// creeps instead of rounding to nothing.
++		const int wheelStepX = (int)wheelRemainderX;
++		const int wheelStepY = (int)wheelRemainderY;
++		wheelRemainderX -= (float)wheelStepX;
++		wheelRemainderY -= (float)wheelStepY;
++		continuousMouseX += wheelStepX;
++		continuousMouseY += wheelStepY;
++		// The view deliberately does not turn: the stick is driving the cursor,
++		// and a view that swings while you are choosing a weapon both looks wrong
++		// and leaves you aiming somewhere you did not pick.
++	} else if ( hasDedicatedLookAxis || !ButtonState( UB_STRAFE ) ) {
+ 		// positive axis values mean stick right/down; turning right decreases yaw and
+ 		// looking down increases pitch, matching the mouse and keyboard handling above
+-		viewangles[YAW] -= anglespeed * in_yawSpeed.GetFloat() * joystickLookSensitivity * lookAxisX;
+-		viewangles[PITCH] += anglespeed * in_pitchSpeed.GetFloat() * joystickLookSensitivity * lookAxisY;
++		const float padScaleX = idMath::ClampFloat( 0.1f, 4.0f, in_padLookScaleX.GetFloat() );
++		const float padScaleY = idMath::ClampFloat( 0.1f, 4.0f, in_padLookScaleY.GetFloat() );
++		viewangles[YAW] -= anglespeed * in_yawSpeed.GetFloat() * joystickLookSensitivity * padScaleX * lookAxisX;
++		viewangles[PITCH] += anglespeed * in_pitchSpeed.GetFloat() * joystickLookSensitivity * padScaleY * lookAxisY;
+ 	}
+ 
+ 	if ( hasDedicatedLookAxis ) {
+@@ -1217,6 +1443,12 @@
+ 		// get basic movement from joystick
+ 		JoystickMove();
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++		// touch look, in absolute view degrees
++		TouchLook( true );
++		TouchMove( true );
++#endif
++
+ 		// check to make sure the angles haven't wrapped
+ 		if ( viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
+ 			viewangles[PITCH] = oldAngles[PITCH] + 90;
+@@ -1226,6 +1458,10 @@
+ 	} else {
+ 		mouseDx = 0;
+ 		mouseDy = 0;
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++		TouchLook( false );
++		TouchMove( false );
++#endif
+ 	}
+ 
+ 	for ( i = 0; i < 3; i++ ) {
+@@ -1658,3 +1894,58 @@
+ 	cmd.impulse = impulse;
+ 	cmd.flags = flags;
+ }
++
++/*
++=================
++iOS direct touch on in-world GUIs — the transport (openQ4-ios D-071)
++
++The game module decides which panel a tap lands on, because `idPlayer::UpdateFocus`
++owns the focus ray and lives in the separate `openQ4-game` dylib. The shell cannot
++call into that dylib (the game API is fixed and one-directional), so the touch
++point crosses the boundary the only way that costs nothing: as cvars, which the
++game reads through the `cvarSystem` pointer it is already handed.
++
++  in_touchAimActive  1 while a finger is down in the free (look) area and has not
++                     yet become a drag.
++  in_touchAimX/Y     that finger in normalised device coords, -1..1, +x right and
++                     +y UP. The centre of the screen is exactly (0,0), which must
++                     reproduce the crosshair ray bit-for-bit.
++  in_touchAimSeq     bumped once per tap. The game prints its `[touchaim]` line
++                     once per sequence number rather than once per tic.
++  in_touchAimClick   1 for the ~6 tics of the tap's click. It is NOT BUTTON_ATTACK:
++                     a tap must never fire the weapon (D-071), and the game only
++                     turns this into a gui mouse-click when a gui already has focus.
++
++None of these are archived: they describe a finger that is on the glass right
++now. They ARE marked CVAR_NOCHEAT, which is not cosmetic: this engine treats
++every otherwise-unflagged cvar as a cheat (idInternalCVar::UpdateCheat) and
++starting a multiplayer server resets all of them (AsyncServer.cpp:182), so
++without the flag an Arena match would quietly zero the touch point mid-play.
++openQ4-ios D-085 found that the hard way with the safe-area insets.
++=================
++*/
++static idCVar in_touchAimActive( "in_touchAimActive", "0", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_BOOL,
++	"iOS: a touch is steering the in-world gui focus ray" );
++static idCVar in_touchAimX( "in_touchAimX", "0", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_FLOAT,
++	"iOS: touch point x in normalised device coords, -1..1, +right" );
++static idCVar in_touchAimY( "in_touchAimY", "0", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_FLOAT,
++	"iOS: touch point y in normalised device coords, -1..1, +up" );
++static idCVar in_touchAimSeq( "in_touchAimSeq", "0", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_INTEGER,
++	"iOS: increments once per tap, so diagnostics print once per tap" );
++static idCVar in_touchAimClick( "in_touchAimClick", "0", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_BOOL,
++	"iOS: a tap is asking the focused in-world gui for a click" );
++
++extern "C" void OpenQ4_iOS_SetTouchAim( int active, float ndcX, float ndcY ) {
++	if ( active ) {
++		in_touchAimX.SetFloat( ndcX );
++		in_touchAimY.SetFloat( ndcY );
++		in_touchAimSeq.SetInteger( in_touchAimSeq.GetInteger() + 1 );
++		in_touchAimActive.SetBool( true );
++	} else {
++		in_touchAimActive.SetBool( false );
++	}
++}
++
++extern "C" void OpenQ4_iOS_SetTouchAimClick( int down ) {
++	in_touchAimClick.SetBool( down != 0 );
++}

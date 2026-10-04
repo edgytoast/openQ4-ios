@@ -1,0 +1,362 @@
+--- a/src/game/Player.cpp
++++ b/src/game/Player.cpp
+@@ -7440,14 +7440,49 @@
+ 		return;
+ 	}
+ 
+-	if ( ( oldButtons ^ usercmd.buttons ) & BUTTON_ATTACK ) {
++#ifdef OPENQ4_IOS
++	/*
++	 iOS: a tap on an in-world panel clicks it (openQ4-ios D-071).
++
++	 The tap deliberately does NOT assert BUTTON_ATTACK. Fire and use are the
++	 same button in Quake 4, so a tap that asserted attack would shoot the wall
++	 whenever the finger missed a panel. This path is only reached when a gui
++	 already has focus (Weapon_GUI is chosen by ActiveGui() in Weapon_Combat's
++	 dispatch, which also clears flagCanFire), so a tap can click a panel and can
++	 never fire the weapon. Only the attack BUTTON fires.
++
++	 The shell holds in_touchAimClick for ~6 tics, because a down and an up
++	 inside one 60 Hz tic nets the button state back to zero before the game
++	 samples it and the click vanishes silently (dhewm3-ios D-013).
++	*/
++	bool touchClickDown = false;
++	bool touchClickEdge = false;
++	{
++		static bool s_touchClickWasDown = false;
++		touchClickDown = cvarSystem->GetCVarBool( "in_touchAimClick" );
++		touchClickEdge = ( touchClickDown != s_touchClickWasDown );
++		s_touchClickWasDown = touchClickDown;
++	}
++#else
++	const bool touchClickDown = false;
++	const bool touchClickEdge = false;
++#endif
++
++	bool attackEdge = ( ( oldButtons ^ usercmd.buttons ) & BUTTON_ATTACK ) != 0;
++	bool clickDown  = ( usercmd.buttons & BUTTON_ATTACK ) != 0;
++	if ( !attackEdge && touchClickEdge ) {
++		attackEdge = true;
++		clickDown  = touchClickDown;
++	}
++
++	if ( attackEdge ) {
+ 		sysEvent_t ev;
+  		const char *command = NULL;
+ 		bool updateVisuals = false;
+ 
+ 		idUserInterface *ui = ActiveGui();
+ 		if ( ui ) {
+- 			ev = sys->GenerateMouseButtonEvent( 1, ( usercmd.buttons & BUTTON_ATTACK ) != 0 );
++ 			ev = sys->GenerateMouseButtonEvent( 1, clickDown );
+ 			command = ui->HandleEvent( &ev, gameLocal.time, &updateVisuals );
+ 			if ( updateVisuals && focusEnt && ui == focusUI ) {
+ 				focusEnt->UpdateVisuals();
+@@ -7876,7 +7911,57 @@
+ 	talkCursor = 0;
+ 	start = GetEyePosition();
+ 	end = start + viewAngles.ToForward() * 768.0f;
++
++#ifdef OPENQ4_IOS
++	/*
++	 iOS direct touch on in-world GUIs (openQ4-ios D-071).
++
++	 The stock focus ray is the crosshair — eye + forward — so operating one of
++	 Quake 4's wall consoles, ammo stations or airlock panels means "aim at it,
++	 then press fire". That is a mouse-and-keyboard idiom with nothing on a
++	 touchscreen to suggest it.
++
++	 When the shell reports a live touch, cast through THAT screen point instead,
++	 so the panel under the player's finger is the panel that takes focus. The
++	 cursor within the panel is already absolute below (the GuiTrace hit point is
++	 fed in as pt.x * SCREEN_WIDTH), so once the ray is right the whole
++	 interaction is right. Only the ray changes; range rules, GuiTrace and cursor
++	 placement are untouched.
+ 
++	 The centre of the screen is ndc (0,0), which makes dir == viewAngles forward
++	 exactly — the change is an identity at the old behaviour's operating point.
++	 The transport is engine cvars, published by the shell (see UsercmdGen.cpp);
++	 with in_touchAimActive clear this whole block is skipped and behaviour is
++	 bit-identical to stock.
++	*/
++	int    touchSeq   = 0;
++	bool   touchAim   = false;
++	float  touchNdcX  = 0.0f, touchNdcY = 0.0f;
++	float  touchFovX  = 0.0f, touchFovY = 0.0f;
++	idVec3 touchFwd( 0.0f, 0.0f, 0.0f ), touchRight( 0.0f, 0.0f, 0.0f ), touchDir( 0.0f, 0.0f, 0.0f );
++	const char *touchOutcome = "no interactive gui under the ray";
++	idStr touchDetail;
++
++	if ( cvarSystem->GetCVarBool( "in_touchAimActive" ) ) {
++		touchAim  = true;
++		touchSeq  = cvarSystem->GetCVarInteger( "in_touchAimSeq" );
++		touchNdcX = cvarSystem->GetCVarFloat( "in_touchAimX" );
++		touchNdcY = cvarSystem->GetCVarFloat( "in_touchAimY" );
++
++		idVec3 f, r, u;
++		viewAngles.ToVectors( &f, &r, &u );
++		gameLocal.CalcFov( CalcFov( true ), touchFovX, touchFovY );
++		// ndc is -1..1 with +x right and +y up; scale by the half-angle tangents.
++		touchDir = f
++		         + r * ( idMath::Tan( DEG2RAD( touchFovX * 0.5f ) ) * touchNdcX )
++		         + u * ( idMath::Tan( DEG2RAD( touchFovY * 0.5f ) ) * touchNdcY );
++		touchDir.Normalize();
++		touchFwd   = f;
++		touchRight = r;
++		end = start + touchDir * 768.0f;
++	}
++#endif
++
+  	// player identification -> names to the hud
+  	if ( gameLocal.isMultiplayer && entityNumber == gameLocal.localClientNum ) {
+ 		trace_t trace;
+@@ -8357,12 +8442,26 @@
+ 
+ 			const float guiFocusLength = ( end - start ).LengthFast() * pt.fraction;
+ 
++#ifdef OPENQ4_IOS
++			if ( touchAim ) {
++				touchDetail = va( "ent=%s gui=%d guipt=%.3f,%.3f cursor=%.0f,%.0f dist=%.1f",
++				                  ent->GetName(), pt.guiId, pt.x, pt.y,
++				                  pt.x * SCREEN_WIDTH, pt.y * SCREEN_HEIGHT, guiFocusLength );
++			}
++#endif
++
+ 			// Any GUI that is too far away will just get bracket focus so the player can still shoot 
+ 			// but still see which guis are interractive
+ 			if ( guiFocusLength > 300.0f ) {
++#ifdef OPENQ4_IOS
++				touchOutcome = "cleared: gui further than 300 units";
++#endif
+ 				ClearFocus ( );
+ 				break;
+ 			} else if ( guiFocusLength > 80.0f ) {
++#ifdef OPENQ4_IOS
++				touchOutcome = "brackets only: gui further than 80 units";
++#endif
+ 				ClearFocus ( );
+ 				focusType = FOCUS_BRACKETS;
+ #ifdef _XENON
+@@ -8444,6 +8543,9 @@
+ 			hud->SetStateInt( "hideInteractive", 0 );
+ #endif
+ 
++#ifdef OPENQ4_IOS
++			touchOutcome = "FOCUS_GUI";
++#endif
+ 			SetFocus ( FOCUS_GUI, FOCUS_GUI_TIME, ent, ui );
+ 			break;
+ 		}
+@@ -8511,6 +8613,31 @@
+  		cursor->SetStateInt( "talkcursor", talkCursor );
+  	}
+  
++
++#ifdef OPENQ4_IOS
++	/*
++	 One line per tap, UNCONDITIONAL (openQ4-ios D-071).
++
++	 It is not gated on com_developer: that reads false inside the game module
++	 even with com_developer 1 set at the console, and a diagnostic gated on the
++	 subsystem being debugged nearly cost dhewm3-ios a finished feature (their
++	 D-014). Throttled by the shell's per-tap sequence number instead of by time,
++	 so it is exactly one line per finger-down and never a per-tic flood.
++	*/
++	{
++		static int s_touchAimPrintedSeq = -1;
++		if ( touchAim && touchSeq != s_touchAimPrintedSeq ) {
++			s_touchAimPrintedSeq = touchSeq;
++			common->Printf( "[touchaim] seq=%d ndc=%.3f,%.3f fov=%.1fx%.1f dir=(%.3f,%.3f,%.3f) dot_fwd=%.3f dot_right=%.3f %s%s%s\n",
++			                touchSeq, touchNdcX, touchNdcY, touchFovX, touchFovY,
++			                touchDir.x, touchDir.y, touchDir.z,
++			                touchDir * touchFwd, touchDir * touchRight,
++			                touchOutcome,
++			                touchDetail.Length() ? " " : "", touchDetail.c_str() );
++		}
++	}
++#endif
++
+ }
+ 
+ /*
+--- a/src/mpgame/Player.cpp
++++ b/src/mpgame/Player.cpp
+@@ -7289,14 +7289,49 @@
+ 		return;
+ 	}
+ 
+-	if ( ( oldButtons ^ usercmd.buttons ) & BUTTON_ATTACK ) {
++#ifdef OPENQ4_IOS
++	/*
++	 iOS: a tap on an in-world panel clicks it (openQ4-ios D-071).
++
++	 The tap deliberately does NOT assert BUTTON_ATTACK. Fire and use are the
++	 same button in Quake 4, so a tap that asserted attack would shoot the wall
++	 whenever the finger missed a panel. This path is only reached when a gui
++	 already has focus (Weapon_GUI is chosen by ActiveGui() in Weapon_Combat's
++	 dispatch, which also clears flagCanFire), so a tap can click a panel and can
++	 never fire the weapon. Only the attack BUTTON fires.
++
++	 The shell holds in_touchAimClick for ~6 tics, because a down and an up
++	 inside one 60 Hz tic nets the button state back to zero before the game
++	 samples it and the click vanishes silently (dhewm3-ios D-013).
++	*/
++	bool touchClickDown = false;
++	bool touchClickEdge = false;
++	{
++		static bool s_touchClickWasDown = false;
++		touchClickDown = cvarSystem->GetCVarBool( "in_touchAimClick" );
++		touchClickEdge = ( touchClickDown != s_touchClickWasDown );
++		s_touchClickWasDown = touchClickDown;
++	}
++#else
++	const bool touchClickDown = false;
++	const bool touchClickEdge = false;
++#endif
++
++	bool attackEdge = ( ( oldButtons ^ usercmd.buttons ) & BUTTON_ATTACK ) != 0;
++	bool clickDown  = ( usercmd.buttons & BUTTON_ATTACK ) != 0;
++	if ( !attackEdge && touchClickEdge ) {
++		attackEdge = true;
++		clickDown  = touchClickDown;
++	}
++
++	if ( attackEdge ) {
+ 		sysEvent_t ev;
+  		const char *command = NULL;
+ 		bool updateVisuals = false;
+ 
+ 		idUserInterface *ui = ActiveGui();
+ 		if ( ui ) {
+- 			ev = sys->GenerateMouseButtonEvent( 1, ( usercmd.buttons & BUTTON_ATTACK ) != 0 );
++ 			ev = sys->GenerateMouseButtonEvent( 1, clickDown );
+ 			command = ui->HandleEvent( &ev, gameLocal.time, &updateVisuals );
+ 			if ( updateVisuals && focusEnt && ui == focusUI ) {
+ 				focusEnt->UpdateVisuals();
+@@ -7828,7 +7863,57 @@
+ 	talkCursor = 0;
+ 	start = GetEyePosition();
+ 	end = start + viewAngles.ToForward() * 768.0f;
++
++#ifdef OPENQ4_IOS
++	/*
++	 iOS direct touch on in-world GUIs (openQ4-ios D-071).
++
++	 The stock focus ray is the crosshair — eye + forward — so operating one of
++	 Quake 4's wall consoles, ammo stations or airlock panels means "aim at it,
++	 then press fire". That is a mouse-and-keyboard idiom with nothing on a
++	 touchscreen to suggest it.
++
++	 When the shell reports a live touch, cast through THAT screen point instead,
++	 so the panel under the player's finger is the panel that takes focus. The
++	 cursor within the panel is already absolute below (the GuiTrace hit point is
++	 fed in as pt.x * SCREEN_WIDTH), so once the ray is right the whole
++	 interaction is right. Only the ray changes; range rules, GuiTrace and cursor
++	 placement are untouched.
+ 
++	 The centre of the screen is ndc (0,0), which makes dir == viewAngles forward
++	 exactly — the change is an identity at the old behaviour's operating point.
++	 The transport is engine cvars, published by the shell (see UsercmdGen.cpp);
++	 with in_touchAimActive clear this whole block is skipped and behaviour is
++	 bit-identical to stock.
++	*/
++	int    touchSeq   = 0;
++	bool   touchAim   = false;
++	float  touchNdcX  = 0.0f, touchNdcY = 0.0f;
++	float  touchFovX  = 0.0f, touchFovY = 0.0f;
++	idVec3 touchFwd( 0.0f, 0.0f, 0.0f ), touchRight( 0.0f, 0.0f, 0.0f ), touchDir( 0.0f, 0.0f, 0.0f );
++	const char *touchOutcome = "no interactive gui under the ray";
++	idStr touchDetail;
++
++	if ( cvarSystem->GetCVarBool( "in_touchAimActive" ) ) {
++		touchAim  = true;
++		touchSeq  = cvarSystem->GetCVarInteger( "in_touchAimSeq" );
++		touchNdcX = cvarSystem->GetCVarFloat( "in_touchAimX" );
++		touchNdcY = cvarSystem->GetCVarFloat( "in_touchAimY" );
++
++		idVec3 f, r, u;
++		viewAngles.ToVectors( &f, &r, &u );
++		gameLocal.CalcFov( CalcFov( true ), touchFovX, touchFovY );
++		// ndc is -1..1 with +x right and +y up; scale by the half-angle tangents.
++		touchDir = f
++		         + r * ( idMath::Tan( DEG2RAD( touchFovX * 0.5f ) ) * touchNdcX )
++		         + u * ( idMath::Tan( DEG2RAD( touchFovY * 0.5f ) ) * touchNdcY );
++		touchDir.Normalize();
++		touchFwd   = f;
++		touchRight = r;
++		end = start + touchDir * 768.0f;
++	}
++#endif
++
+  	// player identification -> names to the hud
+  	if ( gameLocal.isMultiplayer && IsLocalClient() ) {
+ 		trace_t trace;
+@@ -8264,12 +8349,26 @@
+ 
+ 			const float guiFocusLength = ( end - start ).LengthFast() * pt.fraction;
+ 
++#ifdef OPENQ4_IOS
++			if ( touchAim ) {
++				touchDetail = va( "ent=%s gui=%d guipt=%.3f,%.3f cursor=%.0f,%.0f dist=%.1f",
++				                  ent->GetName(), pt.guiId, pt.x, pt.y,
++				                  pt.x * SCREEN_WIDTH, pt.y * SCREEN_HEIGHT, guiFocusLength );
++			}
++#endif
++
+ 			// Any GUI that is too far away will just get bracket focus so the player can still shoot 
+ 			// but still see which guis are interractive
+ 			if ( guiFocusLength > 300.0f ) {
++#ifdef OPENQ4_IOS
++				touchOutcome = "cleared: gui further than 300 units";
++#endif
+ 				ClearFocus ( );
+ 				break;
+ 			} else if ( guiFocusLength > 80.0f ) {
++#ifdef OPENQ4_IOS
++				touchOutcome = "brackets only: gui further than 80 units";
++#endif
+ 				ClearFocus ( );
+ 				focusType = FOCUS_BRACKETS;
+ #ifdef _XENON
+@@ -8351,6 +8450,9 @@
+ 			hud->SetStateInt( "hideInteractive", 0 );
+ #endif
+ 
++#ifdef OPENQ4_IOS
++			touchOutcome = "FOCUS_GUI";
++#endif
+ 			SetFocus ( FOCUS_GUI, FOCUS_GUI_TIME, ent, ui );
+ 			break;
+ 		}
+@@ -8418,6 +8520,31 @@
+  		cursor->SetStateInt( "talkcursor", talkCursor );
+  	}
+  
++
++#ifdef OPENQ4_IOS
++	/*
++	 One line per tap, UNCONDITIONAL (openQ4-ios D-071).
++
++	 It is not gated on com_developer: that reads false inside the game module
++	 even with com_developer 1 set at the console, and a diagnostic gated on the
++	 subsystem being debugged nearly cost dhewm3-ios a finished feature (their
++	 D-014). Throttled by the shell's per-tap sequence number instead of by time,
++	 so it is exactly one line per finger-down and never a per-tic flood.
++	*/
++	{
++		static int s_touchAimPrintedSeq = -1;
++		if ( touchAim && touchSeq != s_touchAimPrintedSeq ) {
++			s_touchAimPrintedSeq = touchSeq;
++			common->Printf( "[touchaim] seq=%d ndc=%.3f,%.3f fov=%.1fx%.1f dir=(%.3f,%.3f,%.3f) dot_fwd=%.3f dot_right=%.3f %s%s%s\n",
++			                touchSeq, touchNdcX, touchNdcY, touchFovX, touchFovY,
++			                touchDir.x, touchDir.y, touchDir.z,
++			                touchDir * touchFwd, touchDir * touchRight,
++			                touchOutcome,
++			                touchDetail.Length() ? " " : "", touchDetail.c_str() );
++		}
++	}
++#endif
++
+ }
+ 
+ /*

@@ -1,0 +1,272 @@
+name: openQ4
+options:
+  deploymentTarget:
+    iOS: "16.0"
+  bundleIdPrefix: com.rebelancap
+  createIntermediateGroups: true
+
+# xcodegen only emits schemes when they are declared, and `xcodebuild archive`
+# (the OTA publish path) requires a real scheme — not an auto-created one.
+schemes:
+  openQ4:
+    build:
+      targets:
+        openQ4: all
+    archive:
+      config: Release
+  # Declared explicitly for the same reason as the iOS one: xcodegen emits no
+  # scheme unless asked, and `xcodebuild archive` (the OTA publish path) has
+  # nothing to archive without a real one.
+  openQ4-visionOS:
+    build:
+      targets:
+        openQ4-visionOS: all
+    archive:
+      config: Release
+
+targets:
+  openQ4:
+    type: application
+    platform: iOS
+    sources:
+      - path: shell
+        optional: true
+      - path: Assets.xcassets
+        buildPhase: resources
+      # The four .lproj directories (en/fr/it/es — exactly pak0's languages).
+      # xcodegen scans a source directory for *.lproj and emits ONE variant
+      # group per file, which is what makes the bundle carry en.lproj/…,
+      # fr.lproj/… rather than four same-named resources fighting each other.
+      # Listing the .lproj dirs individually does NOT do that, so this stays a
+      # single path at the level ABOVE them.
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rebelancap.openq4
+        PRODUCT_NAME: openQ4
+        # No team here (D-113): device builds pass DEVELOPMENT_TEAM from
+        # scripts/signing.local.sh, so the public tree carries no signing IDs.
+        # Simulator lanes build unsigned and need none.
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
+        # Deliberately a loud placeholder, never a plausible number (D-091).
+        # The real values come from scripts/version-strings.sh on the xcodebuild
+        # command line; a project default that LOOKS like a version is how
+        # 0.1.0/1 shipped inside every build for the life of the port.
+        MARKETING_VERSION: 0.0.0-unset
+        CURRENT_PROJECT_VERSION: 0
+        ENABLE_BITCODE: NO
+        # App Intents (D-112) are the iOS target's first Swift: ios/shell/
+        # OpenQ4Intents.swift, reaching the C URL handler through this header.
+        # The entry point stays SDL's ObjC main — Swift here is a library, not
+        # the app's @main (that is visionOS's shape, never iOS's: D-089).
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/shell/OpenQ4-Bridging-Header.h"
+        # LOAD-BEARING, do not remove. xcodebuild archive strips the binary,
+        # which removes vkGetInstanceProcAddr — the symbol SDL looks up with
+        # dlsym(RTLD_DEFAULT, ...) to find statically linked MoltenVK. The app
+        # then fails at window creation with "Failed to load Vulkan Portability
+        # library", but ONLY in OTA/IPA installs; cable builds never strip and
+        # hide the bug entirely. (vkQuake-ios D-027.)
+        STRIP_INSTALLED_PRODUCT: NO
+        COPY_PHASE_STRIP: NO
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../build/ios"
+          - "$(SRCROOT)/../build/ios-deps/sdl-prefix/lib"
+          - "$(SRCROOT)/../build/ios-deps/moltenvk/lib"
+          - "$(SRCROOT)/../build/ios-deps/openal-prefix/lib"
+        OTHER_LDFLAGS:
+          # -force_load, not -l: the engine's main() and a great many
+          # self-registering translation units would otherwise be dead-stripped
+          # out of a static archive.
+          - "-ObjC"
+          - "-force_load"
+          - "$(SRCROOT)/../build/ios/libopenq4.a"
+          - "-lSDL3"
+          - "-lMoltenVK"
+          - "-lopenal"
+          - "-lc++"
+          - "-lz"
+          - "-liconv"
+          # openal-soft REPLACES the global aligned operator new/delete, and a
+          # replaceable allocation function exported from the main executable is
+          # used by EVERY C++ image in the process — including Apple's. CoreText
+          # is C++ inside, and with openal's posix_memalign/free standing in for
+          # libc++'s aligned allocator it silently rasterises some glyphs to
+          # nothing: on this device 'a', 's', 'g', 'S' and '%' vanished from
+          # every UIKit label in the app while 'A', 'G', 'e' and digits were
+          # fine. Reproduced exactly on macOS in a 40-line program by defining
+          # these same operators; see D-060.
+          #
+          # openal-soft only means this as a shim for macOS < 10.13, but its
+          # guard tests MAC_OS_X_VERSION_MIN_REQUIRED, which on an iOS build is
+          # a macOS macro left at a legacy value, so the shim compiles in on a
+          # platform whose libc++ has had aligned new for years. Upstreaming
+          # candidate.
+          #
+          # Unexporting rather than patching vendor: the definitions stay, our
+          # own image still binds to them locally, and dyld stops handing them
+          # to everyone else. Nothing outside this executable links openal.
+          - "-Wl,-unexported_symbol,__ZnwmSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZnamSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdlPvSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdaPvSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZnwmSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZnamSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdlPvSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdaPvSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdlPvmSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdaPvmSt11align_val_t"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: IOSurface.framework
+      - sdk: CoreGraphics.framework
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMotion.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      - sdk: GameController.framework
+      - sdk: MetricKit.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: Security.framework
+      - sdk: UniformTypeIdentifiers.framework
+      # Linked despite nothing using GLES: -ObjC force-loads SDL3's unused
+      # UIKit GLES view, which references it. (vkQuake-ios D-008.)
+      - sdk: OpenGLES.framework
+
+  # ---------------------------------------------------------------------------
+  # visionOS 2D (Phase 5, D-090). A SECOND target in the SAME project; the iOS
+  # target above is untouched — not "mostly unchanged", untouched: every visionOS
+  # delta lives here, in ios/shell-visionos/, in ios/compat/openq4_ios_compat.h,
+  # or behind TARGET_OS_VISION in a shell source whose #else branch is textually
+  # what it always was.
+  #
+  # Same bundle id as iOS on purpose (program lesson: q2repro retired its
+  # separate 3D app — one app, one bundle id, 3D as a mode).
+  #
+  # SwiftUI entry (D-089): shell-visionos supplies @main, and the engine is built
+  # with OPENQ4_SWIFT_MAIN so it exports openq4_engine_main instead of main.
+  # ---------------------------------------------------------------------------
+  openQ4-visionOS:
+    type: application
+    platform: visionOS
+    sources:
+      - path: shell
+        optional: true
+      - path: shell-visionos
+      - path: Assets-visionos.xcassets
+        buildPhase: resources
+      # Same single path at the level ABOVE the .lproj dirs as the iOS target —
+      # see the comment there for why listing them individually breaks.
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rebelancap.openq4
+        PRODUCT_NAME: openQ4
+        # No team here (D-113): device builds pass DEVELOPMENT_TEAM from
+        # scripts/signing.local.sh, so the public tree carries no signing IDs.
+        # Simulator lanes build unsigned and need none.
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "7"
+        # 2.5, NOT 2.0. The prebuilt MoltenVK 1.4.1 xrOS slices are stamped
+        # minos 2.5 (they are vendored, not built by us), so every object we
+        # compile is raised to meet them — otherwise the link step warns
+        # "object file was built for newer visionOS version" on every
+        # translation unit. XROS_MIN in the three lane scripts agrees. (D-090;
+        # D-089 "Open" is what this closes.)
+        XROS_DEPLOYMENT_TARGET: "2.5"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info-visionos.plist
+        # See the iOS target: placeholder on purpose, overridden per build.
+        MARKETING_VERSION: 0.0.0-unset
+        CURRENT_PROJECT_VERSION: 0
+        ENABLE_BITCODE: NO
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/shell-visionos/OpenQ4Vision-Bridging-Header.h"
+        # Same reason as the iOS target, verbatim: archiving strips the binary,
+        # which removes vkGetInstanceProcAddr — the symbol SDL dlsym's to find
+        # statically linked MoltenVK.
+        STRIP_INSTALLED_PRODUCT: NO
+        COPY_PHASE_STRIP: NO
+        GCC_PREPROCESSOR_DEFINITIONS:
+          # OPENQ4_IOS stays on: visionOS shares the touch/lifecycle/filesystem
+          # shape, and forking every shared #if would be the wrong axis (D-089).
+          - "OPENQ4_IOS=1"
+          - "OPENQ4_VISIONOS=1"
+          - "OPENQ4_SWIFT_MAIN=1"
+          # Phase 6 stereo (D-100): the ImmersiveSpace, the compositor thread
+          # and the bridge's !xr3d/!xr3diag. visionOS only — every new code path
+          # on the shared shell sources is behind this or TARGET_OS_VISION, so
+          # the iOS target compiles byte-for-byte what it compiled before.
+          - "OPENQ4_VISIONOS_3D=1"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../build/visionos"
+          - "$(SRCROOT)/../build/visionos-deps/sdl-prefix/lib"
+          - "$(SRCROOT)/../build/visionos-deps/moltenvk/lib"
+          - "$(SRCROOT)/../build/visionos-deps/openal-prefix/lib"
+        OTHER_LDFLAGS:
+          - "-ObjC"
+          - "-force_load"
+          - "$(SRCROOT)/../build/visionos/libopenq4.a"
+          - "-lSDL3"
+          - "-lMoltenVK"
+          - "-lopenal"
+          - "-lc++"
+          - "-lz"
+          - "-liconv"
+          # D-060, and it is NOT iOS-specific: openal-soft replaces the global
+          # aligned operator new/delete, and a replaceable allocation function
+          # exported from the main executable is used by every C++ image in the
+          # process — CoreText included, which is how glyphs went missing from
+          # UIKit labels. Same ten symbols, same reason.
+          - "-Wl,-unexported_symbol,__ZnwmSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZnamSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdlPvSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdaPvSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZnwmSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZnamSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdlPvSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdaPvSt11align_val_tRKSt9nothrow_t"
+          - "-Wl,-unexported_symbol,__ZdlPvmSt11align_val_t"
+          - "-Wl,-unexported_symbol,__ZdaPvmSt11align_val_t"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: IOSurface.framework
+      - sdk: CoreGraphics.framework
+      - sdk: UIKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: Foundation.framework
+      - sdk: CoreVideo.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      - sdk: GameController.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: Security.framework
+      - sdk: UniformTypeIdentifiers.framework
+      # Absent from this list on purpose, present on iOS:
+      #   OpenGLES  — does not exist on visionOS. The iOS target links it only
+      #               because -ObjC force-loads SDL3's unused UIKit GLES view;
+      #               SDL's visionOS build compiles no such view, so nothing
+      #               references it here.
+      #   CoreMotion — does not exist on visionOS. Gyro aim is gated out through
+      #               OPENQ4_HAVE_GYRO (ios/compat/openq4_ios_compat.h).
+      #   MetricKit  — not available on visionOS either.

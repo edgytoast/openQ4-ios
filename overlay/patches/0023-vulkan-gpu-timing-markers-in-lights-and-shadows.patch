@@ -1,0 +1,66 @@
+--- a/src/renderer/Vulkan/vk_Interactions.cpp
++++ b/src/renderer/Vulkan/vk_Interactions.cpp
+@@ -3600,6 +3600,11 @@
+ (maxDepth 1.0) restored.
+ ====================
+ */
++// vk_GuiExecutor.cpp: GPU pass timing (r_vkGpuTimes). The shadow atlas is
++// rendered from inside this pass, so only this file can bracket it.
++void VK_GpuTimes_BeginShadowMapStage( void );
++void VK_GpuTimes_EndShadowMapStage( void );
++
+ void VK_Interactions_DrawLights( const viewDef_t *viewDef ) {
+ 	if ( viewDef == NULL || viewDef->viewLights == NULL ) {
+ 		return;
+@@ -3650,7 +3655,12 @@
+ 		interPass.layoutShadowed = VK_Exec_ShadowInteractionPipelineLayout();
+ 		if ( interPass.layoutShadowed != VK_NULL_HANDLE
+ 				&& ( interPass.pipelineShadowed != VK_NULL_HANDLE || interPass.pipelinePointShadowed != VK_NULL_HANDLE ) ) {
+-			if ( VK_ShadowMap_RenderAtlas( viewDef ) ) {
++			// both are real encoder boundaries: the atlas render ends the
++			// main scope and resumes it around its own caster passes
++			VK_GpuTimes_BeginShadowMapStage();
++			const bool atlasRendered = VK_ShadowMap_RenderAtlas( viewDef );
++			VK_GpuTimes_EndShadowMapStage();
++			if ( atlasRendered ) {
+ 				interPass.shadowSetAtlas = VK_Exec_ShadowDescriptorSet();
+ 				interPass.shadowPassPrepared = interPass.shadowSetAtlas != VK_NULL_HANDLE;
+ 			}
+--- a/src/renderer/Vulkan/vk_ShadowMap.cpp
++++ b/src/renderer/Vulkan/vk_ShadowMap.cpp
+@@ -100,6 +100,11 @@
+ VkPipelineLayout VK_Exec_BasePipelineLayout( void );
+ bool VK_Exec_BeginMainRendering( bool clearColorDepth );
+ void VK_Exec_EndMainRendering( void );
++// vk_GuiExecutor.cpp: render-pass/load/store accounting and the one-shot pass
++// trace (r_vkGpuTimes). The site string names the pass in the trace; the reason
++// names why the main scope ended, which is why there is a pass here at all.
++void VK_GpuTimes_CountRendering( const VkRenderingInfo *renderingInfo, const char *site );
++void VK_GpuTimes_NoteScopeEnd( const char *reason );
+ bool VK_Exec_UpdateShadowAtlasDescriptors( VkImageView view, VkSampler compareSampler, VkSampler rawSampler );
+ bool VK_Exec_CreateShadowCubeSets( VkImageView cubeView, VkSampler compareSampler, VkSampler rawSampler, VkDescriptorSet sets[ VK_FRAMES_IN_FLIGHT ] );
+ VkDescriptorSet VK_Exec_ShadowDescriptorSet( void );
+@@ -4539,6 +4544,7 @@
+ 		return false;
+ 	}
+ 
++	VK_GpuTimes_NoteScopeEnd( "ShadowAtlas" );
+ 	VK_Exec_EndMainRendering();
+ 
+ 	vkCasterPassCtx_t ctx;
+@@ -4616,6 +4622,7 @@
+ 			ri.pDepthAttachment = &depth;
+ 			ri.pStencilAttachment =
+ 					vkCtx.shadowDepthHasStencil ? &depth : NULL;
++			VK_GpuTimes_CountRendering( &ri, "shadow-atlas" );
+ 			vkCmdBeginRendering( cmd, &ri );
+ 
+ 			vkCmdBindPipeline( cmd,
+@@ -5244,6 +5251,7 @@
+ 					ri.layerCount = 1;
+ 					ri.pDepthAttachment = &depth;
+ 					ri.pStencilAttachment = vkCtx.shadowDepthHasStencil ? &depth : NULL;
++					VK_GpuTimes_CountRendering( &ri, "shadow-cube-face" );
+ 					vkCmdBeginRendering( cmd, &ri );
+ 
+ 					if ( classicCommit ) {

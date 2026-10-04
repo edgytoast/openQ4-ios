@@ -1,0 +1,6 @@
+/*
+ * InfoPlist.strings (en) — the Bluetooth purpose string iOS shows in the
+ * permission alert. fr/it/es carry machine translations since D-112.
+ */
+"NSBluetoothAlwaysUsageDescription" = "openQ4 can connect to Bluetooth game controllers.";
+"NSBluetoothPeripheralUsageDescription" = "openQ4 can connect to Bluetooth game controllers.";

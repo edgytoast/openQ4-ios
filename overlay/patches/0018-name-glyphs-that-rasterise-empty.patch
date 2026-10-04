@@ -1,0 +1,65 @@
+--- a/src/renderer/tr_fontTTF.cpp
++++ b/src/renderer/tr_fontTTF.cpp
+@@ -708,12 +708,33 @@
+ 	int tallest = 0;
+ 	int rendered = 0;
+ 
++	/*
++	 * Letters that the face covers but that produced no pixels.
++	 *
++	 * A glyph that fails here keeps its advance and loses its image, so the word
++	 * still spaces correctly with a hole where the letter was — which is exactly
++	 * what "every word is missing its a, s and g" looks like. That report arrived
++	 * from hardware against a build whose menus were provably intact on the
++	 * simulator, so whatever causes it is size- or device-dependent and the log
++	 * has to be able to name the characters rather than leave them to be guessed
++	 * at from a photograph.
++	 *
++	 * Printable ASCII only: the upper range is legitimately uncovered by several
++	 * of the shipped faces and warning about it would bury the signal.
++	 */
++	char missing[96];
++	int  numMissing = 0;
++
+ 	for ( int i = 0; i < count; i++ ) {
+ 		const int codepoint = (int)codePoints[i];
+ 		const int glyphIndex = face.GlyphForCodepoint( codepoint );
++		const bool printable = ( codepoint > 32 && codepoint < 127 );
+ 
+ 		ttGlyphMetrics_t metrics;
+ 		if ( !face.GetGlyphMetrics( glyphIndex, metrics ) ) {
++			if ( printable && numMissing < (int)sizeof( missing ) - 1 ) {
++				missing[ numMissing++ ] = (char)codepoint;
++			}
+ 			continue;
+ 		}
+ 		rasters[i].advance = metrics.advance;
+@@ -725,9 +746,15 @@
+ 			continue;
+ 		}
+ 		if ( !face.RasterizeGlyph( glyphIndex, scale, rasters[i].bitmap ) ) {
++			if ( printable && numMissing < (int)sizeof( missing ) - 1 ) {
++				missing[ numMissing++ ] = (char)codepoint;
++			}
+ 			continue;
+ 		}
+ 		if ( rasters[i].bitmap.pixels == NULL ) {
++			if ( printable && numMissing < (int)sizeof( missing ) - 1 ) {
++				missing[ numMissing++ ] = (char)codepoint;
++			}
+ 			continue;
+ 		}
+ 
+@@ -739,6 +766,12 @@
+ 		rendered++;
+ 	}
+ 
++	if ( numMissing > 0 ) {
++		missing[ numMissing ] = '\0';
++		common->Warning( "TTF font: '%s' %ipt rasterised no pixels for %i printable glyph(s): %s (em %.1f px, upscale %.3f)",
++						 fontName, pointSize, numMissing, missing, pixelEm, slotUpscale );
++	}
++
+ 	if ( rendered == 0 ) {
+ 		for ( int i = 0; i < count; i++ ) {
+ 			idTrueTypeFont::FreeGlyphBitmap( rasters[i].bitmap );

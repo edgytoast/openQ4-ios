@@ -1,0 +1,30 @@
+# The savegame compatibility stamp, asserted by every iOS build (D-084, D-110).
+#
+# This is OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH as produced by upstream's
+# tools/build/generate_savegame_compat_header.py run against PRISTINE upstream
+# at the commits in UPSTREAM.pin:
+#
+#   python3 vendor/openQ4/tools/build/generate_savegame_compat_header.py \
+#       --project-root vendor/openQ4 --game-stage-root vendor/openQ4-game \
+#       --header-out /dev/stdout
+#
+# scripts/gen-savegame-compat-header.sh recomputes it on every build and fails
+# loudly if it differs, so the value written into new saves is a function of
+# the pin and never of our patched trees or of build order.
+#
+# What it gates changed with the v0.13.2 pin (D-110). Up to 227ee810 the engine
+# (framework/Session.cpp) and both game modules (gamesys/SaveGame.cpp) refused
+# any v2 save whose stamp was not this exact string. From v0.13.2 saves carry a
+# v3 payload whose compatibility gate is the payload VERSION plus the wire ABI
+# (and a build floor of 661); a stamp mismatch on a v3 save is only a developer
+# print. Every v2 save — i.e. every save made by 0.1.0.64 and earlier — is
+# refused outright by upstream's design ("no v2 snapshot has a verified
+# decoder"), independently of this value.
+#
+# UPDATE THIS FILE ONLY WHEN UPSTREAM.pin MOVES. Never update it to silence a
+# build failure: a dirty vendor tree or a changed generator is a bug to find.
+#
+# Pin at the time of recording: engine fcdd5696 (v0.13.2), game 8f411dbc (404 files).
+# Previous: f77698bc04082fd9ab0a38102ef17267ca6f5e6e02d54712e62c73f0593cbffe (227ee810 + 61a3c10d).
+
+fdd2c6015e12533ae5a49a1c7bcda21f7b9129f2739fcd3a7563dac828115eb4

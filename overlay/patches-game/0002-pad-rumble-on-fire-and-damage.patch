@@ -1,0 +1,114 @@
+--- a/src/game/PlayerView.cpp
++++ b/src/game/PlayerView.cpp
+@@ -239,7 +239,26 @@
+ 	return oldest;
+ }
+ 
++#ifdef OPENQ4_IOS
+ /*
++ openQ4-ios D-111: controller rumble for the two things a player feels most.
++
++ Upstream rumbles from sound alone (channels with `shakes`), which in retail
++ data is set pieces and never a shot or a hit; Raven's console build rumbled on
++ both (the "jnewquist: Controller rumble" markers below are what is left of it).
++ The engine owns the motors, so this only asks: `rumbleEvent` merges the pulse
++ into the sound-driven stream and applies in_joystickRumble, the overall scale
++ and the per-kind in_joystickRumbleFire / in_joystickRumbleDamage.
++*/
++static void PlayerView_RumbleEvent( const char *kind, float strength, int msec ) {
++	if ( !gameLocal.isNewFrame ) {
++		return;	// a prediction re-run already asked for this one
++	}
++	cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rumbleEvent %s %.3f %d\n", kind, idMath::ClampFloat( 0.0f, 1.0f, strength ), msec ) );
++}
++#endif
++
++/*
+ ==============
+ idPlayerView::DamageImpulse
+ 
+@@ -250,6 +269,12 @@
+ // RAVEN BEGIN
+ // jnewquist: Controller rumble
+ void idPlayerView::DamageImpulse( idVec3 localKickDir, const idDict *damageDef, int damage, const char *damageDefName ) {
++#ifdef OPENQ4_IOS
++	if ( damage > 0 ) {
++		// a scratch is a bump, 50+ is the heaviest the pad does
++		PlayerView_RumbleEvent( "damage", 0.35f + damage / 50.0f, idMath::ClampInt( 120, 400, 120 + damage * 4 ) );
++	}
++#endif
+ 
+ 	//
+ 	// double vision effect
+@@ -479,6 +504,14 @@
+ 	int		recoilTime;
+ 
+ 	recoilTime = weaponDef->GetInt( "recoilTime" );
++#ifdef OPENQ4_IOS
++	if ( player != NULL && player == gameLocal.GetLocalPlayer() ) {
++		// recoilTime is the weapons' own weight scale: 100 (blaster, gauntlet),
++		// 145 (nailgun, lightning gun) ... 500 (grenades, rockets, dark matter)
++		const float weight = idMath::ClampFloat( 0.0f, 1.0f, ( recoilTime - 100 ) / 400.0f );
++		PlayerView_RumbleEvent( "fire", 0.3f + 0.7f * weight, idMath::ClampInt( 60, 220, 60 + recoilTime / 3 ) );
++	}
++#endif
+ 	// don't shorten a damage kick in progress
+ 	if ( recoilTime && recoilTime > (kickFinishTime - gameLocal.time) ) {
+ 		idAngles angles;
+--- a/src/mpgame/PlayerView.cpp
++++ b/src/mpgame/PlayerView.cpp
+@@ -279,7 +279,26 @@
+ 	return oldest;
+ }
+ 
++#ifdef OPENQ4_IOS
+ /*
++ openQ4-ios D-111: controller rumble for the two things a player feels most.
++
++ Upstream rumbles from sound alone (channels with `shakes`), which in retail
++ data is set pieces and never a shot or a hit; Raven's console build rumbled on
++ both (the "jnewquist: Controller rumble" markers below are what is left of it).
++ The engine owns the motors, so this only asks: `rumbleEvent` merges the pulse
++ into the sound-driven stream and applies in_joystickRumble, the overall scale
++ and the per-kind in_joystickRumbleFire / in_joystickRumbleDamage.
++*/
++static void PlayerView_RumbleEvent( const char *kind, float strength, int msec ) {
++	if ( !gameLocal.isNewFrame ) {
++		return;	// a prediction re-run already asked for this one
++	}
++	cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rumbleEvent %s %.3f %d\n", kind, idMath::ClampFloat( 0.0f, 1.0f, strength ), msec ) );
++}
++#endif
++
++/*
+ ==============
+ idPlayerView::DamageImpulse
+ 
+@@ -290,6 +309,12 @@
+ // RAVEN BEGIN
+ // jnewquist: Controller rumble
+ void idPlayerView::DamageImpulse( idVec3 localKickDir, const idDict *damageDef, int damage, const char *damageDefName ) {
++#ifdef OPENQ4_IOS
++	if ( damage > 0 ) {
++		// a scratch is a bump, 50+ is the heaviest the pad does
++		PlayerView_RumbleEvent( "damage", 0.35f + damage / 50.0f, idMath::ClampInt( 120, 400, 120 + damage * 4 ) );
++	}
++#endif
+ 	//
+ 	// double vision effect
+ 	//
+@@ -515,6 +540,14 @@
+ 	int		recoilTime;
+ 
+ 	recoilTime = weaponDef->GetInt( "recoilTime" );
++#ifdef OPENQ4_IOS
++	if ( player != NULL && player == gameLocal.GetLocalPlayer() ) {
++		// recoilTime is the weapons' own weight scale: 100 (blaster, gauntlet),
++		// 145 (nailgun, lightning gun) ... 500 (grenades, rockets, dark matter)
++		const float weight = idMath::ClampFloat( 0.0f, 1.0f, ( recoilTime - 100 ) / 400.0f );
++		PlayerView_RumbleEvent( "fire", 0.3f + 0.7f * weight, idMath::ClampInt( 60, 220, 60 + recoilTime / 3 ) );
++	}
++#endif
+ 	// don't shorten a damage kick in progress
+ 	if ( recoilTime && recoilTime > (kickFinishTime - gameLocal.time) ) {
+ 		idAngles angles;

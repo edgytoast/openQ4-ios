@@ -1,0 +1,473 @@
+--- a/src/renderer/Vulkan/VulkanDevice.cpp
++++ b/src/renderer/Vulkan/VulkanDevice.cpp
+@@ -523,16 +523,39 @@
+ 		}
+ 	}
+ 
++	// The window's reported pixel size wins over caps.currentExtent whenever it
++	// is smaller.
++	//
++	// On a surface whose size is window-driven (currentExtent 0xFFFFFFFF) the
++	// window is the only source, as before. But on a surface that reports a
++	// concrete currentExtent — every Metal surface, where it is the layer's
++	// current drawableSize — taking it unconditionally made the requested size
++	// unreachable: the extent could only ever equal what the layer already had,
++	// so a front-end that asked for fewer pixels got its request silently
++	// rounded back up to native and the swapchain was recreated to the same
++	// size it started at. Honouring a smaller request is what makes a
++	// render-resolution control possible at all on such a surface; the
++	// presentation engine scales the result to the surface on the way out.
++	//
++	// Only smaller: a request ABOVE currentExtent is a resize the window system
++	// has not agreed to yet, and adopting it here would fight the resize path
++	// rather than follow it.
++	renderModuleWindowInfo_t info;
++	memset( &info, 0, sizeof( info ) );
++	if ( vkWindowServices != NULL && vkWindowServices->RefreshNativeWindowHandles != NULL ) {
++		vkWindowServices->RefreshNativeWindowHandles( &info );
++	}
++
+ 	VkExtent2D extent = caps.currentExtent;
+ 	if ( extent.width == 0xFFFFFFFFu ) {
+-		// surface size is window-driven; poll the engine window
+-		renderModuleWindowInfo_t info;
+-		memset( &info, 0, sizeof( info ) );
+-		if ( vkWindowServices != NULL && vkWindowServices->RefreshNativeWindowHandles != NULL ) {
+-			vkWindowServices->RefreshNativeWindowHandles( &info );
+-		}
++		// surface size is window-driven; the engine window is the only source
+ 		extent.width = info.pixelWidth > 0 ? (uint32_t)info.pixelWidth : 640u;
+ 		extent.height = info.pixelHeight > 0 ? (uint32_t)info.pixelHeight : 480u;
++	} else if ( info.pixelWidth > 0 && info.pixelHeight > 0
++			&& (uint32_t)info.pixelWidth < extent.width
++			&& (uint32_t)info.pixelHeight < extent.height ) {
++		extent.width = (uint32_t)info.pixelWidth;
++		extent.height = (uint32_t)info.pixelHeight;
+ 	}
+ 	if ( extent.width < caps.minImageExtent.width ) {
+ 		extent.width = caps.minImageExtent.width;
+@@ -546,6 +569,18 @@
+ 	if ( caps.maxImageExtent.height > 0 && extent.height > caps.maxImageExtent.height ) {
+ 		extent.height = caps.maxImageExtent.height;
+ 	}
++	// One line per real change, not per recreate: the extent is the whole
++	// answer to "is the render-resolution setting doing anything".
++	{
++		static VkExtent2D lastLogged = { 0u, 0u };
++		if ( extent.width != lastLogged.width || extent.height != lastLogged.height ) {
++			lastLogged = extent;
++			common->Printf( "Vulkan: swapchain extent %ux%u (window %dx%d, surface %ux%u)\n",
++					extent.width, extent.height, info.pixelWidth, info.pixelHeight,
++					caps.currentExtent.width, caps.currentExtent.height );
++		}
++	}
++
+ 	if ( extent.width == 0 || extent.height == 0 ) {
+ 		// minimized window; keep the old swapchain until a real size shows up
+ 		return false;
+@@ -713,6 +748,21 @@
+ 	return memcmp( blob + 16, vkCtx.deviceProperties.pipelineCacheUUID, VK_UUID_SIZE ) == 0;
+ }
+ 
++// openQ4-ios (D-110): the blob size last written (or restored), so the periodic
++// save below writes only when the driver has compiled something new.
++static size_t vkPipelineCacheSavedBytes = 0;
++
++// openQ4-ios (D-110): the save runs while the app can be swipe-killed at any
++// moment, so the file is written to a staging path and promoted over the real
++// one, and it carries a trailer — magic, blob length, CRC32 of the blob — that
++// the loader checks before the driver ever sees the bytes. A file that fails
++// the check (truncated, torn, or written by a build without the trailer) is
++// discarded with one log line and the cache starts empty.
++static const char *VK_PIPELINE_CACHE_STAGED_FILE = "generated/vulkan/pipeline.cache.tmp";
++static const uint32_t VK_PIPELINE_CACHE_TRAILER_MAGIC = 0x50345130u;	// "0Q4P"
++static const int VK_PIPELINE_CACHE_TRAILER_BYTES = 12;
++static bool vkPipelineCacheSaveFailed = false;
++
+ static bool VK_Device_CreatePipelineCache( void ) {
+ 	VkPipelineCacheCreateInfo pcci;
+ 	memset( &pcci, 0, sizeof( pcci ) );
+@@ -724,16 +774,41 @@
+ 	idFile *file = osPath != NULL ? fileSystem->OpenExplicitFileRead( osPath ) : NULL;
+ 	if ( file != NULL ) {
+ 		const int length = file->Length();
+-		if ( length >= VK_PIPELINE_CACHE_HEADER_BYTES && length < ( 256 << 20 ) ) {
++		const char *rejected = NULL;
++		if ( length < VK_PIPELINE_CACHE_HEADER_BYTES + VK_PIPELINE_CACHE_TRAILER_BYTES
++				|| length >= ( 256 << 20 ) ) {
++			rejected = "bad size";
++		} else {
+ 			blob = (byte *)Mem_Alloc( length );
+-			if ( file->Read( blob, length ) == length ) {
+-				blobBytes = length;
++			if ( file->Read( blob, length ) != length ) {
++				rejected = "short read";
+ 			} else {
++				uint32_t magic = 0, storedBytes = 0, storedCrc = 0;
++				const byte *trailer = blob + length - VK_PIPELINE_CACHE_TRAILER_BYTES;
++				memcpy( &magic, trailer + 0, sizeof( magic ) );
++				memcpy( &storedBytes, trailer + 4, sizeof( storedBytes ) );
++				memcpy( &storedCrc, trailer + 8, sizeof( storedCrc ) );
++				const int payloadBytes = length - VK_PIPELINE_CACHE_TRAILER_BYTES;
++				if ( magic != VK_PIPELINE_CACHE_TRAILER_MAGIC ) {
++					rejected = "no trailer";
++				} else if ( storedBytes != (uint32_t)payloadBytes ) {
++					rejected = "length mismatch";
++				} else if ( CRC32_BlockChecksum( blob, payloadBytes ) != storedCrc ) {
++					rejected = "checksum mismatch";
++				} else {
++					blobBytes = payloadBytes;
++				}
++			}
++			if ( rejected != NULL ) {
+ 				Mem_Free( blob );
+ 				blob = NULL;
+ 			}
+ 		}
+ 		fileSystem->CloseFile( file );
++		if ( rejected != NULL ) {
++			common->Printf( "Vulkan: discarding damaged pipeline cache (%s, %d bytes); starting empty\n",
++					rejected, length );
++		}
+ 	}
+ 
+ 	if ( blob != NULL && !VK_Device_PipelineCacheBlobMatchesDevice( blob, blobBytes ) ) {
+@@ -761,43 +836,246 @@
+ 		return false;
+ 	}
+ 	common->Printf( "Vulkan: pipeline cache %s\n", blobBytes > 0 ? "restored" : "created empty" );
++	vkPipelineCacheSavedBytes = (size_t)blobBytes;
+ 	return true;
+ }
+ 
+-static void VK_Device_SavePipelineCache( void ) {
++static bool VK_Device_SavePipelineCache( void ) {
+ 	if ( vkCtx.device == VK_NULL_HANDLE || vkCtx.pipelineCache == VK_NULL_HANDLE ) {
+-		return;
++		return false;
+ 	}
+ 	size_t blobBytes = 0;
+ 	if ( vkGetPipelineCacheData( vkCtx.device, vkCtx.pipelineCache, &blobBytes, NULL ) != VK_SUCCESS
+-			|| blobBytes < (size_t)VK_PIPELINE_CACHE_HEADER_BYTES ) {
+-		return;
++			|| blobBytes < (size_t)VK_PIPELINE_CACHE_HEADER_BYTES || blobBytes >= ( 256u << 20 ) ) {
++		return false;
+ 	}
+-	byte *blob = (byte *)Mem_Alloc( (int)blobBytes );
++	// openQ4-ios (D-110): blob + trailer to a staging file, synced, then promoted
++	// over the real one (upstream's LevelLoadCache WriteAtomic pattern). A kill at
++	// any point leaves either the previous complete file or the new one.
++	byte *blob = (byte *)Mem_Alloc( (int)blobBytes + VK_PIPELINE_CACHE_TRAILER_BYTES );
+ 	if ( vkGetPipelineCacheData( vkCtx.device, vkCtx.pipelineCache, &blobBytes, blob ) != VK_SUCCESS ) {
+ 		Mem_Free( blob );
+-		return;
++		return false;
+ 	}
+-	idFile *file = fileSystem->OpenFileWrite( VK_PIPELINE_CACHE_FILE, "fs_savepath" );
+-	if ( file != NULL ) {
+-		file->Write( blob, (int)blobBytes );
++	const uint32_t trailer[ 3 ] = { VK_PIPELINE_CACHE_TRAILER_MAGIC, (uint32_t)blobBytes,
++			CRC32_BlockChecksum( blob, (int)blobBytes ) };
++	memcpy( blob + blobBytes, trailer, sizeof( trailer ) );
++	const int fileBytes = (int)blobBytes + VK_PIPELINE_CACHE_TRAILER_BYTES;
++
++	const char *failed = NULL;
++	idFile *file = fileSystem->OpenFileWrite( VK_PIPELINE_CACHE_STAGED_FILE, "fs_savepath" );
++	if ( file == NULL ) {
++		failed = "open";
++	} else {
++		const bool complete = file->Write( blob, fileBytes ) == fileBytes;
++		const bool synced = complete && file->Sync();
+ 		fileSystem->CloseFile( file );
++		if ( !synced ) {
++			failed = "write";
++		} else if ( !fileSystem->PromoteFile( VK_PIPELINE_CACHE_STAGED_FILE, VK_PIPELINE_CACHE_FILE, "fs_savepath" ) ) {
++			failed = "rename";
++		}
++		if ( failed != NULL ) {
++			fileSystem->RemoveFileChecked( VK_PIPELINE_CACHE_STAGED_FILE, "fs_savepath" );
++		}
+ 	}
+ 	Mem_Free( blob );
++	if ( failed != NULL ) {
++		// once per session: the periodic save stops trying rather than failing
++		// silently every interval
++		if ( !vkPipelineCacheSaveFailed ) {
++			vkPipelineCacheSaveFailed = true;
++			common->Warning( "Vulkan: pipeline cache save failed (%s); not retrying this session", failed );
++		}
++		return false;
++	}
++	vkPipelineCacheSavedBytes = blobBytes;
++	return true;
+ }
+ 
+ /*
+ ====================
+-VK_Device_RecreateSwapchain
++VK_Device_MaybeSavePipelineCache (openQ4-ios, D-110)
++
++Upstream writes the blob only from VK_Device_Shutdown. An iOS app almost never
++gets there: it is suspended in the background and then killed, so on the
++simulator every launch logged "pipeline cache created empty" and the cache did
++nothing. Instead, every VK_PIPELINE_CACHE_CHECK_FRAMES presented frames ask the
++driver for the blob size (a size query, no copy) and write the blob when it has
++grown since the last write. After a level's pipelines are compiled the size is
++stable and this costs one query per interval.
+ ====================
+ */
+-bool VK_Device_RecreateSwapchain( void ) {
++#define VK_PIPELINE_CACHE_CHECK_FRAMES	600
++
++static void VK_Device_MaybeSavePipelineCache( int frameIndex ) {
++	if ( frameIndex % VK_PIPELINE_CACHE_CHECK_FRAMES != 0 || vkPipelineCacheSaveFailed
++			|| vkCtx.device == VK_NULL_HANDLE || vkCtx.pipelineCache == VK_NULL_HANDLE ) {
++		return;
++	}
++	size_t blobBytes = 0;
++	if ( vkGetPipelineCacheData( vkCtx.device, vkCtx.pipelineCache, &blobBytes, NULL ) != VK_SUCCESS
++			|| blobBytes <= vkPipelineCacheSavedBytes ) {
++		return;
++	}
++	const size_t before = vkPipelineCacheSavedBytes;
++	if ( !VK_Device_SavePipelineCache() ) {
++		return;
++	}
++	common->Printf( "Vulkan: pipeline cache saved (%zu -> %zu bytes)\n", before, vkPipelineCacheSavedBytes );
++}
++
++/*
++====================
++Swapchain recreate accounting and thrash limiter
++
++A recreate is a vkDeviceWaitIdle plus a full teardown and rebuild of every
++per-image object. One of them per frame does not look like anything in the
++stage timers -- it is charged to whichever call happens to sit around it -- so
++a presentation engine that reports SUBOPTIMAL forever reads as a mysteriously
++expensive backend, which is exactly how it presented on iOS: ~10 ms of a 16 ms
++frame with every measured stage summing to 3.
++
++Two mechanisms, both platform-neutral:
++
++  * counts per reason, drained onto the r_vkSpeeds report line, so a recreate
++    that repeats is visible in the number everyone already reads.
++  * a limiter. SUBOPTIMAL means "this still works, but the presentation engine
++    would prefer a different swapchain" -- so if recreating for it did not
++    change the extent, recreating again cannot help either. After a second
++    recreate inside one frame, or four inside sixty frames, at an unchanged
++    extent, one warning names the three sizes involved and SUBOPTIMAL stops
++    triggering recreates until the extent actually changes. OUT_OF_DATE is
++    never suppressed: it means the old swapchain cannot be presented at all.
++====================
++*/
++#define VK_RECREATE_THRASH_WINDOW_FRAMES	60
++#define VK_RECREATE_THRASH_WINDOW_LIMIT		3
++
++static struct {
++	int			counts[ VK_RECREATE_REASON_COUNT ];
++	int			suppressed;
++	int			frameIndex;
++	int			thisFrame;
++	int			inWindow;
++	int			windowStartFrame;
++	VkExtent2D	lastExtent;
++	bool		suppressSuboptimal;
++	bool		warned;
++} vkRecreate;
++
++void VK_Device_NoteFrameBoundary( void ) {
++	vkRecreate.frameIndex++;
++	VK_Device_MaybeSavePipelineCache( vkRecreate.frameIndex );
++	vkRecreate.thisFrame = 0;
++	if ( vkRecreate.frameIndex - vkRecreate.windowStartFrame >= VK_RECREATE_THRASH_WINDOW_FRAMES ) {
++		vkRecreate.windowStartFrame = vkRecreate.frameIndex;
++		vkRecreate.inWindow = 0;
++	}
++}
++
++void VK_Device_TakeRecreateCounts( int *total, int *poll, int *acquire, int *present, int *suppressed ) {
++	int sum = 0;
++	for ( int i = 0; i < VK_RECREATE_REASON_COUNT; i++ ) {
++		sum += vkRecreate.counts[ i ];
++	}
++	if ( total != NULL ) { *total = sum; }
++	if ( poll != NULL ) { *poll = vkRecreate.counts[ VK_RECREATE_POLL ]; }
++	if ( acquire != NULL ) { *acquire = vkRecreate.counts[ VK_RECREATE_ACQUIRE ]; }
++	if ( present != NULL ) {
++		*present = vkRecreate.counts[ VK_RECREATE_PRESENT_SUBOPTIMAL ]
++				+ vkRecreate.counts[ VK_RECREATE_PRESENT_OUT_OF_DATE ];
++	}
++	if ( suppressed != NULL ) { *suppressed = vkRecreate.suppressed; }
++	memset( vkRecreate.counts, 0, sizeof( vkRecreate.counts ) );
++	vkRecreate.suppressed = 0;
++}
++
++/*
++====================
++VK_Device_WarnSwapchainThrash
++
++Names all three sizes, because which pair disagrees is the whole diagnosis: the
++window against the swapchain is a reconcile that is not landing, the surface
++against the swapchain is a presentation engine that wants a size the extent
++selection refused to adopt.
++====================
++*/
++static void VK_Device_WarnSwapchainThrash( void ) {
++	renderModuleWindowInfo_t info;
++	memset( &info, 0, sizeof( info ) );
++	if ( vkWindowServices != NULL && vkWindowServices->RefreshNativeWindowHandles != NULL ) {
++		vkWindowServices->RefreshNativeWindowHandles( &info );
++	}
++	VkSurfaceCapabilitiesKHR caps;
++	memset( &caps, 0, sizeof( caps ) );
++	(void)vkGetPhysicalDeviceSurfaceCapabilitiesKHR( vkCtx.physicalDevice, vkCtx.surface, &caps );
++	common->Warning( "Vulkan: swapchain thrash: requested %dx%d, surface %ux%u, swapchain %ux%u "
++			"-- suppressing SUBOPTIMAL recreates until the requested extent changes",
++			info.pixelWidth, info.pixelHeight,
++			caps.currentExtent.width, caps.currentExtent.height,
++			vkCtx.swapchainExtent.width, vkCtx.swapchainExtent.height );
++}
++
++/*
++====================
++VK_Device_RecreateSwapchainForReason
++====================
++*/
++bool VK_Device_RecreateSwapchainForReason( vkRecreateReason_t reason ) {
+ 	if ( !vkCtx.initialized ) {
+ 		return false;
+ 	}
++	if ( reason < 0 || reason >= VK_RECREATE_REASON_COUNT ) {
++		reason = VK_RECREATE_OTHER;
++	}
++	if ( reason == VK_RECREATE_PRESENT_SUBOPTIMAL ) {
++		if ( vkRecreate.suppressSuboptimal ) {
++			vkRecreate.suppressed++;
++			return false;
++		}
++		if ( vkRecreate.thisFrame > 0 || vkRecreate.inWindow >= VK_RECREATE_THRASH_WINDOW_LIMIT ) {
++			vkRecreate.suppressSuboptimal = true;
++			vkRecreate.suppressed++;
++			if ( !vkRecreate.warned ) {
++				vkRecreate.warned = true;
++				VK_Device_WarnSwapchainThrash();
++			}
++			return false;
++		}
++	}
+ 	vkDeviceWaitIdle( vkCtx.device );
+ 	R_RendererMetrics_ResetGpuFrameTiming( "Vulkan swapchain recreation" );
+-	return VK_Device_CreateSwapchain();
++	if ( !VK_Device_CreateSwapchain() ) {
++		return false;
++	}
++	vkRecreate.counts[ reason ]++;
++	vkRecreate.thisFrame++;
++	if ( vkCtx.swapchainExtent.width != vkRecreate.lastExtent.width
++			|| vkCtx.swapchainExtent.height != vkRecreate.lastExtent.height ) {
++		// A real size change: the limiter's evidence is stale, and a
++		// suppression that was protecting the old extent has to lift.
++		vkRecreate.lastExtent = vkCtx.swapchainExtent;
++		vkRecreate.inWindow = 0;
++		vkRecreate.windowStartFrame = vkRecreate.frameIndex;
++		vkRecreate.suppressSuboptimal = false;
++		vkRecreate.warned = false;
++	} else {
++		vkRecreate.inWindow++;
++	}
++	// The swapchain extent IS the render target size, so glConfig has to learn
++	// it here rather than at one privileged call site. The other recreates —
++	// OUT_OF_DATE from acquire and from present, in vk_GuiExecutor.cpp — used
++	// to leave glConfig holding the previous size, and the front-end then spent
++	// the following frames drawing a viewport that no longer matched the images
++	// it was drawing into.
++	glConfig.vidWidth = (int)vkCtx.swapchainExtent.width;
++	glConfig.vidHeight = (int)vkCtx.swapchainExtent.height;
++	return true;
++}
++
++bool VK_Device_RecreateSwapchain( void ) {
++	return VK_Device_RecreateSwapchainForReason( VK_RECREATE_OTHER );
+ }
+ 
+ /*
+@@ -807,6 +1085,7 @@
+ */
+ bool VK_Device_Init( const renderWindowServices_s *windowServices ) {
+ 	memset( &vkCtx, 0, sizeof( vkCtx ) );
++	memset( &vkRecreate, 0, sizeof( vkRecreate ) );
+ 	vkWindowServices = windowServices;
+ 
+ 	if ( windowServices == NULL || windowServices->CreateVulkanSurface == NULL
+@@ -1315,7 +1594,7 @@
+ 	VkResult res = vkAcquireNextImageKHR( vkCtx.device, vkCtx.swapchain, UINT64_MAX,
+ 			vkCtx.acquireSemaphores[ slot ], VK_NULL_HANDLE, &imageIndex );
+ 	if ( res == VK_ERROR_OUT_OF_DATE_KHR ) {
+-		if ( !VK_Device_RecreateSwapchain() ) {
++		if ( !VK_Device_RecreateSwapchainForReason( VK_RECREATE_ACQUIRE ) ) {
+ 			return;
+ 		}
+ 		res = vkAcquireNextImageKHR( vkCtx.device, vkCtx.swapchain, UINT64_MAX,
+@@ -1442,7 +1721,8 @@
+ 
+ 	res = vkQueuePresentKHR( vkCtx.graphicsQueue, &pi );
+ 	if ( res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR ) {
+-		VK_Device_RecreateSwapchain();
++		VK_Device_RecreateSwapchainForReason( res == VK_SUBOPTIMAL_KHR
++				? VK_RECREATE_PRESENT_SUBOPTIMAL : VK_RECREATE_PRESENT_OUT_OF_DATE );
+ 	}
+ }
+ 
+@@ -1571,6 +1851,15 @@
+ }
+ 
+ void VK_Device_FlushDeferredDestroys( int slot ) {
++	// upstream b935746: an upload batch that is still open has recorded copies
++	// into images this slot may be about to release; the slot fence does not
++	// cover it, because it is only submitted with the next frame. Submit and
++	// retire it first. (MoltenVK encodes copies at submit time, so it would
++	// dereference the released image.)
++	if ( vkCtx.uploadBatchOpen && vkCtx.numDeferredDestroys[ slot ] > 0 ) {
++		VK_Device_FlushUploadBatch();
++		VK_Device_WaitUploadBatch();
++	}
+ 	for ( int i = 0; i < vkCtx.numDeferredDestroys[ slot ]; i++ ) {
+ 		vkDeferredDestroy_t &entry = vkCtx.deferredDestroys[ slot ][ i ];
+ 		if ( entry.view != VK_NULL_HANDLE ) {
+--- a/src/renderer/Vulkan/VulkanDevice.h
++++ b/src/renderer/Vulkan/VulkanDevice.h
+@@ -160,10 +160,34 @@
+ bool	VK_Device_Init( const renderWindowServices_s *windowServices );
+ void	VK_Device_Shutdown( void );
+ 
++// Why a swapchain recreate happened. A recreate costs a vkDeviceWaitIdle, so
++// one per frame is a stall the frame timers cannot see and no counter shipped
++// upstream would name: it hides inside the wall time of the frame that caused
++// it. Attributing every recreate to its trigger is what turns "the frame is
++// mysteriously slow" into "the presentation engine calls us suboptimal every
++// frame", which is a different bug entirely.
++typedef enum {
++	VK_RECREATE_POLL = 0,		// window pixel size no longer matches the extent
++	VK_RECREATE_ACQUIRE,		// vkAcquireNextImageKHR returned OUT_OF_DATE
++	VK_RECREATE_PRESENT_SUBOPTIMAL,	// vkQueuePresentKHR returned SUBOPTIMAL
++	VK_RECREATE_PRESENT_OUT_OF_DATE,	// vkQueuePresentKHR returned OUT_OF_DATE
++	VK_RECREATE_OTHER,			// init, screen parms, swap interval, torn-down swapchain
++	VK_RECREATE_REASON_COUNT
++} vkRecreateReason_t;
++
+ // recreates the swapchain (resize / OUT_OF_DATE / swap-interval change);
+ // reads the current window pixel size through the services
++bool	VK_Device_RecreateSwapchainForReason( vkRecreateReason_t reason );
+ bool	VK_Device_RecreateSwapchain( void );
+ 
++// one call per presented frame; owns the thrash detector's notion of "frame"
++void	VK_Device_NoteFrameBoundary( void );
++
++// read-and-reset the per-report-window recreate counts. present is
++// SUBOPTIMAL + OUT_OF_DATE together; other covers everything not triggered by
++// the window or the presentation engine.
++void	VK_Device_TakeRecreateCounts( int *total, int *poll, int *acquire, int *present, int *suppressed );
++
+ // Accounts one ordinary indexed draw the way the OpenGL backend's
+ // RB_DrawElementsWithCounters does, so both backends report the same
+ // workload. Shadow-volume draws keep their own c_shadow* counters, which

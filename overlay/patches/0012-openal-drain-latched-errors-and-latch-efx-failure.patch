@@ -1,0 +1,61 @@
+--- a/src/sound/OpenAL/AL_SoundVoice.cpp
++++ b/src/sound/OpenAL/AL_SoundVoice.cpp
+@@ -1512,9 +1512,33 @@
+ {
+ #if OPENQ4_OPENAL_EFX_SUPPORTED
+ 	if( !soundSystemLocal.hardware.HasEFXFilters() || !openQ4_LoadVoiceEfxProcs() || !alIsSource( openalSource ) )
++	{
++		return;
++	}
++	// Once filter creation has genuinely failed, stop asking.
++	//
++	// HasEFXFilters() can report filters as available while alGenFilters returns
++	// AL_OUT_OF_MEMORY — the hardware layer decides EFX is unavailable and
++	// disables the wet send, but this path never learns. It then retries for
++	// every voice, every frame, forever: on a map load that produced 3,455
++	// "OpenAL Error: Out of Memory" lines in a single run, each one a discarded
++	// allocation attempt. One warning and a latch instead.
++	static bool s_efxFiltersUnavailable = false;
++	if( s_efxFiltersUnavailable )
+ 	{
+ 		return;
+ 	}
++
++	// Drain first. AL errors LATCH: alGetError returns the first error since the
++	// last check, so any error left behind by earlier code is reported here as
++	// if qalGenFilters had failed. The filter it actually created is then thrown
++	// away (the handle is zeroed), and this runs again next frame — leaking a
++	// filter per voice per frame until openal-soft really is out of memory.
++	//
++	// On device this produced a continuous storm of
++	// "OpenAL Error: Out of Memory (0xa005)" during a map load, with a real leak
++	// underneath it.
++	CheckALErrors();
+ 	if( openalDirectFilter == 0 )
+ 	{
+ 		qalGenFilters( 1, &openalDirectFilter );
+@@ -1528,6 +1552,10 @@
+ 		else
+ 		{
+ 			openalDirectFilter = 0;
++			s_efxFiltersUnavailable = true;
++			common->Warning( "OpenAL: EFX filter creation failed; disabling filtered sends "
++							 "(further attempts suppressed)" );
++			return;
+ 		}
+ 	}
+ 	if( openalAuxFilter == 0 )
+--- a/src/sound/OpenAL/AL_SoundHardware.cpp
++++ b/src/sound/OpenAL/AL_SoundHardware.cpp
+@@ -1359,6 +1359,11 @@
+ 	}
+ 	if( s_useEAXReverb.GetBool() && efxExtensionPresent && openQ4_LoadHardwareEfxProcs() )
+ 	{
++		// Drain the latched error before attributing one to alGenEffects: every
++		// probe run before this point (device-state capture, event monitoring, the
++		// source-latency test source) can leave one behind, and EFX then takes the
++		// blame for it. This is what made EFX look unavailable on hardware.
++		CheckALErrors();
+ 		qalGenEffects( 1, &auxReverbEffect );
+ 		if( CheckALErrors() == AL_NO_ERROR && auxReverbEffect != 0 )
+ 		{

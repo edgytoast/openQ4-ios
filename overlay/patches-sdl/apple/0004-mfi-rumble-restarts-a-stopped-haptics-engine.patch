@@ -1,0 +1,278 @@
+diff --git a/src/joystick/apple/SDL_mfijoystick.m b/src/joystick/apple/SDL_mfijoystick.m
+--- a/src/joystick/apple/SDL_mfijoystick.m
++++ b/src/joystick/apple/SDL_mfijoystick.m
+@@ -1246,118 +1246,200 @@
+ @property(nonatomic, strong) CHHapticEngine *engine API_AVAILABLE(macos(11.0), ios(13.0), tvos(14.0));
+ @property(nonatomic, strong) id<CHHapticPatternPlayer> player API_AVAILABLE(macos(11.0), ios(13.0), tvos(14.0));
+ @property bool active;
++// openQ4-ios: what the engine was made from, so a stopped engine can be rebuilt.
++@property(nonatomic, weak) GCController *controller API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0));
++@property(nonatomic, copy) GCHapticsLocality locality API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0));
+ @end
+ 
++/*
++ * openQ4-ios: every access to engine/player/active goes through this motor's
++ * own serial queue. CoreHaptics calls stoppedHandler/resetHandler on a queue of
++ * its choosing while the rumble caller (the engine's main loop) may be
++ * rebuilding the engine in startEngine. The handlers never touch the motor
++ * directly: they dispatch_async onto the queue (so a handler can never block
++ * CoreHaptics' own queue waiting for us), and they only act if the motor still
++ * holds the engine instance they were installed on — a late stoppedHandler from
++ * an OLD engine cannot nil a freshly rebuilt one.
++ */
+ @implementation SDL3_RumbleMotor
+ {
++    dispatch_queue_t _queue;
+ }
+ 
+ - (void)cleanup
+ {
+     @autoreleasepool {
+         if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+-            if (self.player != nil) {
+-                [self.player cancelAndReturnError:nil];
+-                self.player = nil;
+-            }
+-            if (self.engine != nil) {
+-                [self.engine stopWithCompletionHandler:nil];
+-                self.engine = nil;
+-            }
++            dispatch_sync(_queue, ^{
++              if (self.player != nil) {
++                  [self.player cancelAndReturnError:nil];
++                  self.player = nil;
++              }
++              if (self.engine != nil) {
++                  [self.engine stopWithCompletionHandler:nil];
++                  self.engine = nil;
++              }
++              self.active = false;
++            });
+         }
+     }
+ }
+ 
+ - (bool)setIntensity:(float)intensity
+ {
+-    @autoreleasepool {
+-        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+-            NSError *error = nil;
+-            CHHapticDynamicParameter *param;
++    __block bool result = true;
+ 
+-            if (self.engine == nil) {
+-                return SDL_SetError("Haptics engine was stopped");
+-            }
++    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
++        dispatch_sync(_queue, ^{
++          @autoreleasepool {
++              result = [self setIntensityOnQueue:intensity];
++          }
++        });
++    }
++    return result;
++}
+ 
+-            if (intensity == 0.0f) {
+-                if (self.player && self.active) {
+-                    [self.player stopAtTime:0 error:&error];
+-                }
+-                self.active = false;
+-                return true;
+-            }
+-
+-            if (self.player == nil) {
+-                CHHapticEventParameter *event_param = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f];
+-                CHHapticEvent *event = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous parameters:[NSArray arrayWithObjects:event_param, nil] relativeTime:0 duration:GCHapticDurationInfinite];
+-                CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:[NSArray arrayWithObject:event] parameters:[[NSArray alloc] init] error:&error];
+-                if (error != nil) {
+-                    return SDL_SetError("Couldn't create haptic pattern: %s", [error.localizedDescription UTF8String]);
+-                }
++// Runs on _queue only.
++- (bool)setIntensityOnQueue:(float)intensity API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0))
++{
++    NSError *error = nil;
++    CHHapticDynamicParameter *param;
+ 
+-                self.player = [self.engine createPlayerWithPattern:pattern error:&error];
+-                if (error != nil) {
+-                    return SDL_SetError("Couldn't create haptic player: %s", [error.localizedDescription UTF8String]);
+-                }
+-                self.active = false;
+-            }
++    /*
++     * openQ4-ios: a controller's haptic engine is STOPPED by the system
++     * whenever the app is suspended (and on an audio-session interruption
++     * or a haptic-server reset failure). The stoppedHandler below nils it,
++     * and nothing ever made a new one, so after the first trip to the
++     * home screen every later rumble failed here until the pad was
++     * re-paired. Rebuild it on demand instead; a failure is still loud.
++     */
++    if (self.engine == nil && intensity != 0.0f) {
++        if (![self startEngineOnQueue]) {
++            return SDL_SetError("Haptics engine was stopped and could not be restarted");
++        }
++    }
++    if (self.engine == nil) {
++        self.active = false;
++        return true; // stopping a stopped motor is a success
++    }
+ 
+-            param = [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:intensity relativeTime:0];
+-            [self.player sendParameters:[NSArray arrayWithObject:param] atTime:0 error:&error];
+-            if (error != nil) {
+-                return SDL_SetError("Couldn't update haptic player: %s", [error.localizedDescription UTF8String]);
+-            }
++    if (intensity == 0.0f) {
++        if (self.player && self.active) {
++            [self.player stopAtTime:0 error:&error];
++        }
++        self.active = false;
++        return true;
++    }
+ 
+-            if (!self.active) {
+-                [self.player startAtTime:0 error:&error];
+-                self.active = true;
+-            }
++    if (self.player == nil) {
++        CHHapticEventParameter *event_param = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f];
++        CHHapticEvent *event = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous parameters:[NSArray arrayWithObjects:event_param, nil] relativeTime:0 duration:GCHapticDurationInfinite];
++        CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:[NSArray arrayWithObject:event] parameters:[[NSArray alloc] init] error:&error];
++        if (error != nil) {
++            return SDL_SetError("Couldn't create haptic pattern: %s", [error.localizedDescription UTF8String]);
+         }
+ 
+-        return true;
++        self.player = [self.engine createPlayerWithPattern:pattern error:&error];
++        if (error != nil) {
++            return SDL_SetError("Couldn't create haptic player: %s", [error.localizedDescription UTF8String]);
++        }
++        self.active = false;
++    }
++
++    param = [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:intensity relativeTime:0];
++    [self.player sendParameters:[NSArray arrayWithObject:param] atTime:0 error:&error];
++    if (error != nil) {
++        return SDL_SetError("Couldn't update haptic player: %s", [error.localizedDescription UTF8String]);
+     }
++
++    if (!self.active) {
++        [self.player startAtTime:0 error:&error];
++        self.active = true;
++    }
++    return true;
+ }
+ 
+ - (id)initWithController:(GCController *)controller locality:(GCHapticsLocality)locality API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0))
+ {
+     @autoreleasepool {
+-        NSError *error;
+-        __weak __typeof(self) weakSelf;
+-        self = [super init];
+-        weakSelf = self;
++        __block bool started = false;
+ 
+-        self.engine = [controller.haptics createEngineWithLocality:locality];
+-        if (self.engine == nil) {
+-            SDL_SetError("Couldn't create haptics engine");
++        self = [super init];
++        if (self == nil) {
+             return nil;
+         }
+-
+-        [self.engine startAndReturnError:&error];
+-        if (error != nil) {
+-            SDL_SetError("Couldn't start haptics engine");
++        _queue = dispatch_queue_create("org.libsdl.mfi.rumblemotor", DISPATCH_QUEUE_SERIAL);
++        self.controller = controller;
++        self.locality = locality;
++        dispatch_sync(_queue, ^{
++          started = [self startEngineOnQueue];
++        });
++        if (!started) {
+             return nil;
+         }
++        return self;
++    }
++}
+ 
+-        self.engine.stoppedHandler = ^(CHHapticEngineStoppedReason stoppedReason) {
+-          SDL3_RumbleMotor *_this = weakSelf;
+-          if (_this == nil) {
+-              return;
+-          }
+-
+-          _this.player = nil;
+-          _this.engine = nil;
+-        };
+-        self.engine.resetHandler = ^{
+-          SDL3_RumbleMotor *_this = weakSelf;
+-          if (_this == nil) {
+-              return;
+-          }
++// Runs on _queue only.
++- (bool)startEngineOnQueue API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0))
++{
++    @autoreleasepool {
++        NSError *error = nil;
++        __weak __typeof(self) weakSelf = self;
++        GCController *controller = self.controller;
++        CHHapticEngine *engine;
++        __weak CHHapticEngine *weakEngine;
++        dispatch_queue_t queue = _queue;
+ 
+-          _this.player = nil;
+-          [_this.engine startAndReturnError:nil];
++        self.player = nil;
++        self.active = false;
++        self.engine = nil;
++        if (controller == nil || controller.haptics == nil) {
++            return SDL_SetError("Controller has no haptics");
++        }
++        engine = [controller.haptics createEngineWithLocality:self.locality];
++        if (engine == nil) {
++            return SDL_SetError("Couldn't create haptics engine");
++        }
++        weakEngine = engine;
++
++        engine.stoppedHandler = ^(CHHapticEngineStoppedReason stoppedReason) {
++          dispatch_async(queue, ^{
++            SDL3_RumbleMotor *_this = weakSelf;
++            CHHapticEngine *stopped = weakEngine;
++            if (_this == nil || stopped == nil || _this.engine != stopped) {
++                return; // an engine this motor has already replaced
++            }
++
++            _this.player = nil;
++            _this.engine = nil;
++            _this.active = false;
++          });
+         };
++        engine.resetHandler = ^{
++          dispatch_async(queue, ^{
++            SDL3_RumbleMotor *_this = weakSelf;
++            CHHapticEngine *reset = weakEngine;
++            if (_this == nil || reset == nil || _this.engine != reset) {
++                return;
++            }
+ 
+-        return self;
++            _this.player = nil;
++            _this.active = false;
++            if (![reset startAndReturnError:nil]) {
++                _this.engine = nil; // rebuilt on the next non-zero intensity
++            }
++          });
++        };
++
++        [engine startAndReturnError:&error];
++        if (error != nil) {
++            return SDL_SetError("Couldn't start haptics engine");
++        }
++        self.engine = engine;
++
++        return true;
+     }
+ }
+ 

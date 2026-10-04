@@ -1,0 +1,19 @@
+openQ4-GameLibs License
+
+This repository is licensed under the QUAKE 4 Software Development Kit
+Limited Use License Agreement (EULA), not the GNU GPL.
+
+The authoritative EULA included in this repository is:
+- EULA.Development Kit.rtf
+
+By using, copying, modifying, or distributing this repository, you agree to
+the terms of that EULA.
+
+Key points from the EULA (non-exhaustive):
+- Limited, non-exclusive license from id Software.
+- Non-commercial distribution and use limits unless separately authorized by
+  id Software in writing.
+- Requires the full version of QUAKE 4 to operate the SDK/game libraries.
+- Provided "AS IS" with warranty and liability limitations.
+
+For full legal terms, read the complete EULA document above.

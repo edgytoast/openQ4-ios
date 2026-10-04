@@ -1,0 +1,332 @@
+/*
+ * Localizable.strings (it) — Italian (pak0: italian_*.lang)
+ *
+ * D-088 slice 1 + D-112 slices 2-3. The comment above each entry says where it
+ * came from:
+ *   #str_NNNNN        copied from openQ4's own pak0 string table for this
+ *                     language (vendor/openQ4/content/baseoq4/pak0/strings/),
+ *                     recased from the menu's ALL CAPS, accents restored;
+ *   #str_NNNNN + MT   built around that pak0 term, the rest machine-translated;
+ *   MT                machine-translated, using the words pak0 uses for the
+ *                     same concepts. Not yet read by a native speaker —
+ *                     docs/localization-map.md lists what to check first.
+ *
+ * Every key the shell reads is present (scripts/check-localization.py). The
+ * per-key English fallback still exists for any key a later change adds.
+ */
+
+/* --- Settings sheet — section headers (kSettings.section; looked up by English name, localised at display) --- */
+/* MT */
+"Aim" = "Mira";
+/* #str_200083 + MT */
+"Touch Controls" = "Comandi touch";
+/* #str_229900 */
+"Display" = "Schermo";
+/* #str_229901 */
+"Audio" = "Audio";
+/* #str_229960 */
+"Gameplay" = "Gameplay";
+/* #str_200002 */
+"Multiplayer" = "Multigiocatore";
+/* #str_41500 */
+"Demos" = "Demo";
+/* #str_200010 */
+"Mods" = "Mod";
+/* same */
+"3D" = "3D";
+
+/* --- Settings sheet — row labels (kSettings.label) --- */
+/* #str_229931 */
+"Look Sensitivity (Horizontal)" = "Sensibilità Mira (Orizzontale)";
+/* #str_229931 */
+"Look Sensitivity (Vertical)" = "Sensibilità Mira (Verticale)";
+/* #str_229933 */
+"Invert Vertical Look" = "Inverti Mira";
+/* #str_229964 + MT */
+"Gyro Aim" = "Mira Giroscopio";
+/* #str_229965 */
+"Gyro Sensitivity (Horizontal)" = "Sensibilità Giroscopio (Orizzontale)";
+/* #str_229965 */
+"Gyro Sensitivity (Vertical)" = "Sensibilità Giroscopio (Verticale)";
+/* #str_229933 + MT */
+"Invert Gyro Pitch" = "Inverti Giroscopio (Verticale)";
+/* #str_229920/#str_229925 + MT */
+"Weapon Wheel Speed (Gamepad)" = "Velocità Ruota Armi (Controller)";
+/* #str_229974 + MT */
+"Customize Touch Layout…" = "Personalizza comandi touch…";
+/* MT */
+"Control Opacity" = "Opacità comandi";
+/* MT */
+"Haptics" = "Feedback aptico";
+/* #str_200099 + MT */
+"Double-Tap Crouch" = "Doppio tocco: abbassati";
+/* MT */
+"Touch Panels Directly" = "Tocca direttamente i pannelli";
+/* MT */
+"Field of View" = "Campo visivo";
+/* #str_200148 */
+"Brightness" = "Luminosità";
+/* #str_41091 + MT */
+"Render Resolution" = "Risoluzione di rendering";
+/* #str_200164 */
+"Anti-aliasing (SMAA)" = "Antialiasing (SMAA)";
+/* MT */
+"FPS Counter" = "Contatore FPS";
+/* #str_200154 */
+"Game Volume" = "Volume globale";
+/* #str_201006 */
+"Music Volume" = "Volume musica";
+/* MT */
+"Other App Audio" = "Audio di altre app";
+/* MT */
+"Always Run" = "Corri sempre";
+/* MT */
+"Extra Master Server" = "Server master aggiuntivo";
+/* #str_200171 + MT */
+"Direct Connect Address" = "Indirizzo connessione diretta";
+/* #str_200171 */
+"Connect…" = "Connetti…";
+/* MT */
+"Record Demo" = "Registra demo";
+/* MT */
+"Active Mod" = "Mod attiva";
+
+/* --- Settings sheet — 3D section rows (visionOS, D-101/D-106) --- */
+/* MT */
+"Screen Distance" = "Distanza schermo";
+/* #str_229946 + MT */
+"Screen Width" = "Larghezza schermo";
+/* #str_229947 + MT */
+"Screen Height" = "Altezza schermo";
+/* MT */
+"Screen Position Height" = "Altezza posizione schermo";
+/* MT */
+"Stereo Depth" = "Profondità stereo";
+/* #str_200307 + MT */
+"Crosshair Distance" = "Distanza mirino";
+/* MT */
+"Panel Resolution" = "Risoluzione pannello";
+/* MT */
+"Surroundings Dimming" = "Oscuramento ambiente";
+/* MT */
+"FPS on Panel" = "FPS sul pannello";
+/* MT */
+"Units" = "Unità";
+/* MT */
+"Recenter Screen" = "Ricentra schermo";
+/* #str_200009 + MT */
+"3D Settings" = "Impostazioni 3D";
+/* #str_42075 */
+"Reset" = "Azzera";
+/* same */
+"m" = "m";
+/* MT */
+"ft" = "ft";
+/* #str_107728 + MT */
+"Playing in 3D" = "In gioco in 3D";
+/* #str_200013 */
+"Exit" = "Esci";
+
+/* --- Settings sheet — option titles (pushed pickers and segments) --- */
+/* MT */
+"50%" = "50%";
+/* MT */
+"66%" = "66%";
+/* MT */
+"75%" = "75%";
+/* MT */
+"85%" = "85%";
+/* MT */
+"Native (100%)" = "Nativa (100%)";
+/* MT */
+"Lower Other Audio" = "Abbassa altro audio";
+/* MT */
+"Play Both" = "Riproduci entrambi";
+/* MT */
+"Stop Other Audio" = "Ferma altro audio";
+/* MT */
+"Lower Game Audio" = "Abbassa audio gioco";
+/* MT */
+"Mute Game Audio" = "Disattiva audio gioco";
+/* #str_41121 */
+"Off" = "No";
+/* #str_41120 */
+"On" = "Sì";
+/* #str_229914 */
+"Auto" = "Auto";
+/* MT */
+"Fire Only" = "Solo fuoco";
+/* MT */
+"While Aiming" = "Durante la mira";
+/* MT */
+"Always" = "Sempre";
+/* MT */
+"On screen" = "Sullo schermo";
+/* MT */
+"None (base game)" = "Nessuna (gioco base)";
+
+/* --- Settings sheet — one sentence per picker option (slice 4 prose, machine-translated; a native reader should check these first) --- */
+/* MT */
+"Quarter the pixels. Longest battery life, softest image." = "Un quarto dei pixel. Massima autonomia, immagine più morbida.";
+/* MT */
+"Two thirds. A large frame-rate gain for a visible softening." = "Due terzi. Grande guadagno di frame rate per un'immagine visibilmente più morbida.";
+/* MT */
+"Three quarters." = "Tre quarti.";
+/* MT */
+"Barely distinguishable from native, with real headroom back." = "Quasi indistinguibile dalla nativa, con un vero margine di prestazioni.";
+/* MT */
+"Renders at the display's full resolution. The default." = "Rendering alla piena risoluzione dello schermo. Predefinito.";
+/* MT */
+"Music or a podcast keeps playing, quieter, while the game plays over it." = "Musica o podcast continuano a un volume più basso, sotto l'audio del gioco.";
+/* MT */
+"Both play at full volume. Useful with your own soundtrack." = "Entrambi a pieno volume. Utile con una colonna sonora tua.";
+/* MT */
+"Starting the game stops whatever else was playing." = "Avviare il gioco ferma qualsiasi altro audio in riproduzione.";
+/* MT */
+"The game drops to the background while something else is playing. Your music stays at full volume." = "Il gioco passa in secondo piano mentre suona altro. La tua musica resta a pieno volume.";
+/* MT */
+"The game goes silent while something else is playing, and comes back when it stops." = "Il gioco tace mentre suona altro e riprende quando finisce.";
+/* MT */
+"The floor. Use this if the picture stutters at all." = "Il minimo. Usalo se l'immagine scatta.";
+/* MT */
+"A modest saving over the default." = "Un risparmio modesto rispetto al predefinito.";
+/* MT */
+"The default. 120 fps measured here in the opening map." = "Predefinito. 120 FPS misurati qui nella prima mappa.";
+/* MT */
+"Sharpest, and about 25% more work per eye. Watch the frame rate." = "Il più nitido, con circa un quarto di lavoro in più per occhio. Tieni d'occhio il frame rate.";
+/* MT */
+"No haptic feedback." = "Nessun feedback aptico.";
+/* MT */
+"A small tap on every button press." = "Un piccolo tocco a ogni pressione.";
+/* MT */
+"A tap on the fire button only — useful there, noise elsewhere." = "Un tocco solo sul tasto di fuoco — utile lì, superfluo altrove.";
+/* MT */
+"The device's motion is ignored." = "Il movimento del dispositivo viene ignorato.";
+/* MT */
+"Only while a finger is down on the look area — coarse aim with the thumb, fine aim with the wrist." = "Solo con un dito sull'area di mira — mira grossolana col pollice, fine col polso.";
+/* MT */
+"Whenever you are in a map. Off in menus and cutscenes either way." = "Ogni volta che sei in una mappa. Sempre disattivo nei menu e nei filmati.";
+/* MT */
+"Quake 4 exactly as it shipped." = "Quake 4 esattamente com'era all'uscita.";
+
+/* --- Settings sheet — chrome, alerts, the mod notice --- */
+/* #str_200009 */
+"openQ4 Settings" = "Impostazioni openQ4";
+/* MT */
+"Done" = "Fine";
+/* #str_41515 */
+"Back" = "Indietro";
+/* #str_104339 */
+"OK" = "OK";
+/* MT */
+"Stop Recording" = "Interrompi registrazione";
+/* MT */
+"host:port" = "host:porta";
+/* MT */
+"No address" = "Nessun indirizzo";
+/* MT */
+"Type a server address in the row above first." = "Prima inserisci l'indirizzo di un server nella riga sopra.";
+/* MT */
+"No mods found. Copy a mod folder — the one containing mod.json — into the openQ4 folder in Files, next to q4base, then come back. Mods that ship their own game code cannot run on iOS." = "Nessuna mod trovata. Copia la cartella di una mod — quella che contiene mod.json — nella cartella openQ4 dell'app File, accanto a q4base, poi torna qui. Le mod che includono un proprio codice di gioco non possono funzionare su iOS.";
+/* #str_200155 + MT */
+"A mod is applied the next time openQ4 starts." = "Una mod viene applicata al prossimo avvio di openQ4.";
+/* MT */
+"openQ4 will start as the base game next time." = "Al prossimo avvio openQ4 partirà con il gioco base.";
+/* #str_200155 + MT */
+"%@ will be loaded the next time openQ4 starts." = "%@ verrà caricata al prossimo avvio di openQ4.";
+/* #str_200155 + MT */
+"Takes effect on next launch" = "Effettivo al prossimo avvio";
+/* MT */
+"Quit openQ4 (swipe it away from the app switcher) and open it again." = "Chiudi openQ4 (scorrilo via dal selettore app) e riaprilo.";
+
+/* --- Touch overlay — accessibility labels of the icon-only buttons --- */
+/* #str_107032 */
+"Menu" = "Menu";
+/* #str_200380 */
+"Objectives" = "Obiettivi";
+/* #str_200009 */
+"Settings" = "Impostazioni";
+/* #str_42075 + MT */
+"Reset Layout" = "Azzera disposizione";
+/* MT */
+"Save Layout" = "Salva disposizione";
+
+/* --- Onboarding (first run, before the engine exists) --- */
+/* MT */
+"openQ4 needs your own copy of Quake 4.\n\nCopy the game's q4base folder into this app's folder using the Files app, or tap below to choose it directly.\n\nQuake 4 from Steam or GOG already includes the 1.4.2 patch that openQ4 requires." = "openQ4 richiede una tua copia di Quake 4.\n\nCopia la cartella q4base del gioco nella cartella di questa app con l'app File, oppure tocca qui sotto per sceglierla direttamente.\n\nQuake 4 di Steam o GOG include già la patch 1.4.2 richiesta da openQ4.";
+/* MT */
+"Choose Quake 4 Folder" = "Scegli la cartella di Quake 4";
+/* MT */
+"I Added Files — Check Again" = "Ho aggiunto i file — Controlla di nuovo";
+/* #str_200020 + MT */
+"Start openQ4" = "Avvia openQ4";
+/* MT */
+"Folder could not be read." = "Impossibile leggere la cartella.";
+/* MT */
+"No Quake 4 pak files here. Pick the folder that contains pak001.pk4 … pak022.pk4 (usually called q4base)." = "Nessun file pak di Quake 4 qui. Scegli la cartella che contiene pak001.pk4 … pak022.pk4 (di solito si chiama q4base).";
+/* MT */
+"That folder has no .pk4 files. Choose the folder containing pak001.pk4 … pak022.pk4 (usually q4base)." = "Quella cartella non contiene file .pk4. Scegli la cartella con pak001.pk4 … pak022.pk4 (di solito q4base).";
+/* MT */
+"Two files in that folder differ only in capital letters: %@ and %@. Keep one of them and choose the folder again." = "Due file in quella cartella differiscono solo per le maiuscole: %@ e %@. Tienine uno solo e scegli di nuovo la cartella.";
+/* MT */
+"This looks like an unpatched Quake 4 (%d of 22 paks). openQ4 needs the 1.4.2 patch — Steam and GOG copies already include it. Missing: %@" = "Sembra un Quake 4 senza patch (%d pak su 22). openQ4 richiede la patch 1.4.2 — le copie Steam e GOG la includono già. Mancanti: %@";
+/* MT */
+"Incomplete: %d of 22 required paks. Missing: %@" = "Incompleto: %d pak richiesti su 22. Mancanti: %@";
+/* MT */
+"All 22 required paks found." = "Trovati tutti i 22 pak richiesti.";
+/* MT */
+"Mission-pack maps included." = "Mappe del mission pack incluse.";
+/* MT */
+"%d language pack(s)." = "%d pacchetto/i lingua.";
+/* MT */
+"Not enough free space. Importing needs %.1f GB and this device has %.1f GB free." = "Spazio libero insufficiente. L'importazione richiede %.1f GB e questo dispositivo ne ha %.1f GB liberi.";
+/* MT */
+"Copying %@\n%.1f of %.1f GB" = "Copia di %@\n%.1f di %.1f GB";
+/* MT */
+"Copy failed on %@:\n%@" = "Copia non riuscita per %@:\n%@";
+/* MT */
+"(%d file name(s) lowercased for this device.)" = "(%d nome/i di file convertito/i in minuscolo per questo dispositivo.)";
+/* MT */
+"There is no q4base folder in the openQ4 folder yet." = "Non c'è ancora una cartella q4base nella cartella openQ4.";
+/* MT */
+"Put the q4base folder directly inside the openQ4 folder in Files." = "Metti la cartella q4base direttamente nella cartella openQ4 dell'app File.";
+/* MT */
+"The last import was interrupted before it finished, so none of it was kept. Choose the folder again." = "L'ultima importazione è stata interrotta prima di finire, quindi non è stato tenuto nulla. Scegli di nuovo la cartella.";
+/* MT */
+"Starting..." = "Avvio...";
+
+/* --- App Intents (Shortcuts / Spotlight, D-112). Shortcut PHRASES are English-only: they localise through a separate AppShortcuts.strings --- */
+/* MT */
+"Play Quake 4" = "Gioca a Quake 4";
+/* MT */
+"Opens openQ4." = "Apre openQ4.";
+/* MT */
+"Continue" = "Continua";
+/* MT */
+"Loads your most recent save, or opens openQ4 if there is none." = "Carica il tuo salvataggio più recente, oppure apre openQ4 se non ce n'è uno.";
+/* MT */
+"Load Map" = "Carica mappa";
+/* MT */
+"Starts a map by name, for example game/airdefense1 or mp/q4dm1." = "Avvia una mappa per nome, ad esempio game/airdefense1 o mp/q4dm1.";
+/* MT */
+"Map" = "Mappa";
+/* MT */
+"Which map?" = "Quale mappa?";
+
+/* --- Engine save dialog + Load Game list tag (D-114; OpenQ4_iOS_SaveText, shown by the engine's own message box) --- */
+/* MT */
+"Old version" = "Versione precedente";
+/* #str_104312 + MT */
+"Cannot Load Save" = "Impossibile caricare";
+/* #str_200245 + MT */
+"This save was made by an older version of openQ4 and cannot be restored. Start %s again from the beginning, with the weapons and armor you had? This replaces the level's autosave; a copy of it is kept in the list." = "Questo salvataggio è stato creato da una versione precedente di openQ4 e non può essere ripristinato. Ricominciare %s dall'inizio, con le armi e l'armatura che avevi? Questo sostituisce il salvataggio automatico del livello; una copia viene conservata nell'elenco.";
+"Before restart" = "Prima del riavvio";
+"The level was not restarted: a copy of its autosave could not be kept, so nothing was changed. If Load Game already lists nine \"Before restart\" copies of this level, delete one and try again." = "Il livello non è stato riavviato: non è stato possibile conservare una copia del suo salvataggio automatico, quindi non è cambiato nulla. Se Carica partita mostra già nove copie \"Prima del riavvio\" di questo livello, eliminane una e riprova.";
+/* #str_200245 + MT */
+"This save was made on a different kind of device and cannot be loaded here." = "Questo salvataggio è stato creato su un altro tipo di dispositivo e non può essere caricato qui.";
+/* MT */
+"The level this save needs is not installed." = "Il livello richiesto da questo salvataggio non è installato.";
+/* #str_200245 + MT */
+"This save is damaged or incomplete and cannot be loaded." = "Questo salvataggio è danneggiato o incompleto e non può essere caricato.";
+/* #str_200245 + MT */
+"This save was made by an older version of openQ4 and cannot be restored." = "Questo salvataggio è stato creato da una versione precedente di openQ4 e non può essere ripristinato.";

@@ -1,0 +1,258 @@
+diff --git a/src/video/uikit/SDL_uikitvideo.h b/src/video/uikit/SDL_uikitvideo.h
+--- a/src/video/uikit/SDL_uikitvideo.h
++++ b/src/video/uikit/SDL_uikitvideo.h
+@@ -37,6 +37,13 @@
+ 
+ #ifdef SDL_PLATFORM_VISIONOS
+ extern CGRect UIKit_ComputeViewFrame(SDL_Window *window);
++/* Live geometry of the UIWindowScene this app is actually displayed in, in
++ * points, plus its display scale. visionOS has no UIScreen and no fixed
++ * resolution: the volume is sized by the user and by the system, so every
++ * place that would consult a screen on iOS has to ask the scene instead.
++ * Returns false (and leaves the outputs untouched) when no scene is connected
++ * yet, which is the only case where the SDL_XR_SCREEN* fallback is honest. */
++extern bool UIKit_GetVisionSceneGeometry(SDL_Window *window, CGSize *outSize, CGFloat *outScale);
+ #else
+ extern CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen);
+ #endif
+diff --git a/src/video/uikit/SDL_uikitvideo.m b/src/video/uikit/SDL_uikitvideo.m
+--- a/src/video/uikit/SDL_uikitvideo.m
++++ b/src/video/uikit/SDL_uikitvideo.m
+@@ -211,9 +211,59 @@
+ }
+ 
+ #ifdef SDL_PLATFORM_VISIONOS
++bool UIKit_GetVisionSceneGeometry(SDL_Window *window, CGSize *outSize, CGFloat *outScale)
++{
++    @autoreleasepool {
++        UIWindowScene *scene = nil;
++
++        if (window != NULL && window->internal != NULL) {
++            SDL_UIKitWindowData *data = (__bridge SDL_UIKitWindowData *)window->internal;
++            scene = data.uiwindow.windowScene;
++        }
++        if (scene == nil) {
++            scene = UIKit_GetActiveWindowScene();
++        }
++        if (scene == nil) {
++            return false;
++        }
++
++        CGRect bounds = CGRectZero;
++        if (@available(visionOS 2.0, *)) {
++            bounds = scene.effectiveGeometry.coordinateSpace.bounds;
++        }
++        if (CGRectIsEmpty(bounds)) {
++            bounds = scene.coordinateSpace.bounds;
++        }
++        if (CGRectIsEmpty(bounds)) {
++            return false;
++        }
++
++        CGFloat scale = scene.traitCollection.displayScale;
++        if (scale <= 0.0) {
++            scale = 2.0;
++        }
++
++        if (outSize != NULL) {
++            *outSize = bounds.size;
++        }
++        if (outScale != NULL) {
++            *outScale = scale;
++        }
++        return true;
++    }
++}
++
+ CGRect UIKit_ComputeViewFrame(SDL_Window *window)
+ {
+-    return CGRectMake(window->x, window->y, window->w, window->h);
++    /* Upstream returns CGRectMake(window->x, window->y, window->w, window->h),
++     * which places the view as though the SDL window had been positioned on the
++     * fake SDL_XR_SCREENWIDTH x SDL_XR_SCREENHEIGHT "screen". A visionOS window
++     * has no such coordinate space; the view fills its scene and nothing else. */
++    CGSize size;
++    if (UIKit_GetVisionSceneGeometry(window, &size, NULL)) {
++        return CGRectMake(0, 0, size.width, size.height);
++    }
++    return CGRectMake(0, 0, SDL_XR_SCREENWIDTH, SDL_XR_SCREENHEIGHT);
+ }
+ #else
+ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
+diff --git a/src/video/uikit/SDL_uikitmodes.h b/src/video/uikit/SDL_uikitmodes.h
+--- a/src/video/uikit/SDL_uikitmodes.h
++++ b/src/video/uikit/SDL_uikitmodes.h
+@@ -46,7 +46,12 @@
+ #endif
+ 
+ extern bool UIKit_InitModes(SDL_VideoDevice *_this);
+-#ifndef SDL_PLATFORM_VISIONOS
++#ifdef SDL_PLATFORM_VISIONOS
++extern bool UIKit_AddDisplay(bool send_event);
++/* Re-read the scene's size/scale into the fake display after a geometry
++ * change, so window and display bounds stay the same rectangle. */
++extern void UIKit_UpdateVisionDisplayGeometry(SDL_Window *window);
++#else
+ extern bool UIKit_AddDisplay(UIScreen *uiscreen, bool send_event);
+ extern void UIKit_DelDisplay(UIScreen *uiscreen, bool send_event);
+ #endif
+diff --git a/src/video/uikit/SDL_uikitmodes.m b/src/video/uikit/SDL_uikitmodes.m
+--- a/src/video/uikit/SDL_uikitmodes.m
++++ b/src/video/uikit/SDL_uikitmodes.m
+@@ -273,13 +273,19 @@
+ bool UIKit_AddDisplay(bool send_event)
+ {
+     CGSize size = CGSizeMake(SDL_XR_SCREENWIDTH, SDL_XR_SCREENHEIGHT);
++    CGFloat scale = 2.0;
+     SDL_VideoDisplay display;
+     SDL_DisplayMode mode;
++
++    /* The display IS the scene on visionOS. Reporting the fake 1280x720 makes
++     * SDL centre a larger window at a negative origin and makes every
++     * display-bounds intersection clip the window to two thirds of itself. */
++    UIKit_GetVisionSceneGeometry(NULL, &size, &scale);
+ 
+     SDL_zero(mode);
+     mode.w = (int)size.width;
+     mode.h = (int)size.height;
+-    mode.pixel_density = 2;
++    mode.pixel_density = (float)scale;
+     mode.format = SDL_PIXELFORMAT_ABGR8888;
+     mode.refresh_rate = 90.0f;
+ 
+@@ -300,6 +306,37 @@
+     }
+     return true;
+ }
++
++void UIKit_UpdateVisionDisplayGeometry(SDL_Window *window)
++{
++    SDL_VideoDevice *device = SDL_GetVideoDevice();
++    CGSize size;
++    CGFloat scale;
++
++    if (device == NULL || device->num_displays < 1) {
++        return;
++    }
++    if (!UIKit_GetVisionSceneGeometry(window, &size, &scale)) {
++        return;
++    }
++
++    SDL_VideoDisplay *display = device->displays[0];
++    SDL_DisplayMode mode = display->desktop_mode;
++    const int w = (int)size.width;
++    const int h = (int)size.height;
++
++    if (w <= 0 || h <= 0) {
++        return;
++    }
++    if (mode.w == w && mode.h == h && mode.pixel_density == (float)scale) {
++        return;
++    }
++
++    mode.w = w;
++    mode.h = h;
++    mode.pixel_density = (float)scale;
++    SDL_SetDesktopDisplayMode(display, &mode);
++}
+ #endif
+ 
+ #ifndef SDL_PLATFORM_VISIONOS
+@@ -435,7 +472,9 @@
+     @autoreleasepool {
+         SDL_UIKitDisplayData *data = (__bridge SDL_UIKitDisplayData *)display->internal;
+ #ifdef SDL_PLATFORM_VISIONOS
+-        CGRect frame = CGRectMake(0, 0, SDL_XR_SCREENWIDTH, SDL_XR_SCREENHEIGHT);
++        CGSize sceneSize = CGSizeMake(SDL_XR_SCREENWIDTH, SDL_XR_SCREENHEIGHT);
++        UIKit_GetVisionSceneGeometry(NULL, &sceneSize, NULL);
++        CGRect frame = CGRectMake(0, 0, sceneSize.width, sceneSize.height);
+ #else
+         CGRect frame = data.uiscreen.bounds;
+ #endif
+diff --git a/src/video/uikit/SDL_uikitmetalview.m b/src/video/uikit/SDL_uikitmetalview.m
+--- a/src/video/uikit/SDL_uikitmetalview.m
++++ b/src/video/uikit/SDL_uikitmetalview.m
+@@ -33,6 +33,7 @@
+ #include "../SDL_sysvideo.h"
+ #include "../../events/SDL_windowevents_c.h"
+ 
++#import "SDL_uikitvideo.h"
+ #import "SDL_uikitwindow.h"
+ #import "SDL_uikitmetalview.h"
+ 
+@@ -95,18 +96,22 @@
+ #ifndef SDL_PLATFORM_VISIONOS
+             scale = data.uiwindow.screen.nativeScale;
+ #else
+-            // VisionOS doesn't use the concept of "nativeScale" like other iOS devices.
+-            // We use a fixed scale factor of 2.0 to achieve better pixel density.
+-            // This is because VisionOS presents a virtual 1280x720 "screen", but we need
+-            // to render at a higher resolution for optimal visual quality.
+-            // TODO: Consider making this configurable or determining it dynamically
+-            // based on the specific visionOS device capabilities.
+-            scale = 2.0;
++            /* visionOS has no UIScreen and therefore no nativeScale. The scene's
++             * trait collection carries the real displayScale; the hardcoded 2.0
++             * upstream uses is only correct by coincidence. */
++            if (!UIKit_GetVisionSceneGeometry(window, NULL, &scale) || scale <= 0.0) {
++                scale = 2.0;
++            }
+ #endif
+         }
+ 
++#ifdef SDL_PLATFORM_VISIONOS
++        metalview = [[SDL_uikitmetalview alloc] initWithFrame:UIKit_ComputeViewFrame(window)
++                                                        scale:scale];
++#else
+         metalview = [[SDL_uikitmetalview alloc] initWithFrame:data.uiwindow.bounds
+                                                         scale:scale];
++#endif
+         if (metalview == nil) {
+             SDL_OutOfMemory();
+             return NULL;
+diff --git a/src/video/uikit/SDL_uikitviewcontroller.m b/src/video/uikit/SDL_uikitviewcontroller.m
+--- a/src/video/uikit/SDL_uikitviewcontroller.m
++++ b/src/video/uikit/SDL_uikitviewcontroller.m
+@@ -208,8 +208,26 @@
+     const CGSize size = self.view.bounds.size;
+     int w = (int)size.width;
+     int h = (int)size.height;
++
++#ifdef SDL_PLATFORM_VISIONOS
++    /* A visionOS volume is resized by the user at any time, and the fake
++     * display has to follow it or SDL's window/display bounds stop describing
++     * the same rectangle. The window always sits at the scene's origin. */
++    UIKit_UpdateVisionDisplayGeometry(window);
++    window->x = 0;
++    window->y = 0;
++#endif
+ 
+     SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, w, h);
++#ifdef SDL_PLATFORM_VISIONOS
++    /* SDL_OnWindowResized only forwards a PIXEL_SIZE_CHANGED when the point
++     * size moved; a displayScale change alone must reach the app too. */
++    {
++        int pixel_w = 0, pixel_h = 0;
++        SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
++        SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, pixel_w, pixel_h);
++    }
++#endif
+ }
+ 
+ #ifndef SDL_PLATFORM_TVOS
+diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
+--- a/src/video/uikit/SDL_uikitwindow.m
++++ b/src/video/uikit/SDL_uikitwindow.m
+@@ -376,7 +376,11 @@
+ #ifndef SDL_PLATFORM_VISIONOS
+             scale = windata.uiwindow.screen.nativeScale;
+ #else
+-            scale = 2.0;
++            /* The scene's displayScale, not a constant: visionOS has no
++             * UIScreen, and 2.0 is only right by coincidence today. */
++            if (!UIKit_GetVisionSceneGeometry(window, NULL, &scale) || scale <= 0.0) {
++                scale = 2.0;
++            }
+ #endif
+         }
+ 

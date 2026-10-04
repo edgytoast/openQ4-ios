@@ -1,0 +1,132 @@
+--- a/src/framework/Console.cpp
++++ b/src/framework/Console.cpp
+@@ -29,6 +29,12 @@
+ 
+ 
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++extern "C" void OpenQ4_iOS_SafeAreaFractions( float *l, float *t, float *r, float *b );
++#endif
++#endif
+ #include "Session_local.h"
+ 
+ void SCR_DrawTextLeftAlign( float &y, const char *text, ... ) id_attribute((format(printf,2,3)));
+@@ -1017,6 +1023,63 @@
+ SCR_DrawTextRightAlign
+ ==================
+ */
++/*
++ * Where the diagnostics column starts on iOS, in the engine's 640x480 space.
++ *
++ * The top-LEFT corner, up and left of the shell's gear button: the gear sits at
++ * safeArea.left + 16 pt and 14 pt down, the counter is about 7 pt tall, so it
++ * fits in the band above the gear and a little outboard of it. The gear does not
++ * move for it.
++ *
++ * Both margins are small on purpose — the old right-aligned position had been
++ * pushed a long way inward on both axes to escape the sensor housing and the
++ * bezel radius, and "too far from both edges" is exactly what it looked like.
++ * The left corner needs far less clearance because the safe-area inset already
++ * steps past the housing.
++ *
++ * The one number here that is not simply the system inset is the FLOOR on the
++ * left, and the counter now sits INSIDE the reported inset rather than outside
++ * it. safeAreaInsets.left is ~62 pt with the sensor housing on the left and ~0
++ * pt in the other landscape orientation, and it is a conservative full-height
++ * column: the housing itself is vertically centred, so the top of that column is
++ * ordinary visible glass. What actually limits how far left the text can go, at
++ * 4 pt from the top, is the display's ~62 pt corner radius — the glass does not
++ * begin until roughly 40 pt across. So: step 14 pt inboard of the reported inset
++ * for a visibly left position, with a hard floor that keeps clear of the curve
++ * whichever way the phone is held.
++ *
++ * NOTE, corrected by D-085: a simulator screenshot DOES composite the display
++ * cutout — the Dynamic Island appears as a black pill, vertically centred on the
++ * left edge in landscape, over whatever the app drew there. It was measured on
++ * lane 1 against a lit background (artifacts/sim/safearea). What it does NOT
++ * show is the rounded corner mask, so the corner radius still has to be reasoned
++ * about rather than looked at.
++ */
++static bool SCR_DiagnosticOrigin( float &leftEdgeOut, float &topInsetOut ) {
++	leftEdgeOut = 0.0f;
++	topInsetOut = 0.0f;
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// D-085: the 2D UI viewport is itself inset by the safe area now, so the
++	// whole 640x480 space already starts inboard of the housing and the curve.
++	// Insetting again here would be double-counting — which is what the numbers
++	// below were, once the viewport learned to do it. What is left is an
++	// ordinary small margin, plus enough room to sit left of the gear button
++	// (which the shell places at safeAreaInsets.left + 16 pt).
++	if ( cvarSystem->GetCVarBool( "r_guiSafeInsets" ) ) {
++		leftEdgeOut = 0.010f * SCREEN_WIDTH;
++		topInsetOut = 0.006f * SCREEN_HEIGHT;
++		return true;
++	}
++	float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
++	OpenQ4_iOS_SafeAreaFractions( &l, &t, &r, &b );
++	leftEdgeOut = Max( l - 0.014f, 0.046f ) * SCREEN_WIDTH;
++	topInsetOut = ( Max( t, 0.0f ) + 0.006f ) * SCREEN_HEIGHT;
++	return true;
++#else
++	return false;
++#endif
++}
++
+ void SCR_DrawTextRightAlign( float &y, const char *text, ... ) {
+ 	char string[MAX_STRING_CHARS];
+ 	va_list argptr;
+@@ -1025,8 +1088,18 @@
+ 	va_end( argptr );
+ 	const float charWidth = localConsole.GetSmallCharWidth() * SCR_DIAGNOSTIC_TEXT_SCALE;
+ 	const float charHeight = SMALLCHAR_HEIGHT * SCR_DIAGNOSTIC_TEXT_SCALE;
+-	const float rightEdge = SCREEN_WIDTH - charWidth * 0.5f;
+-	Con_DrawSizedStringExt( rightEdge - i * charWidth, y + SCR_DiagnosticTextTopPadding(), charWidth, charHeight, string, colorWhite, true );
++	float leftEdge = 0.0f, topInset = 0.0f;
++	if ( SCR_DiagnosticOrigin( leftEdge, topInset ) ) {
++		// Left-aligned on iOS: this family and SCR_DrawFPS share one `y`, so
++		// they have to share a corner too, and the corner the maintainer asked for is
++		// the left one. The lines are long (frame pacing prints four of them),
++		// which is a second reason to grow rightwards from a known-good x
++		// rather than leftwards from an edge that may be masked.
++		Con_DrawSizedStringExt( leftEdge, y + topInset + SCR_DiagnosticTextTopPadding(), charWidth, charHeight, string, colorWhite, true );
++	} else {
++		const float rightEdge = SCREEN_WIDTH - charWidth * 0.5f;
++		Con_DrawSizedStringExt( rightEdge - i * charWidth, y + SCR_DiagnosticTextTopPadding(), charWidth, charHeight, string, colorWhite, true );
++	}
+ 	y += SCR_DiagnosticLineAdvance( charHeight );
+ }
+ 
+@@ -1076,10 +1149,29 @@
+ 	}
+ 
+ 	if ( fps >= 0 ) {
+-		const char *s = va( "%ifps", fps );
++		/*
++		 * The NUMBER only — no "fps" suffix (D-106, the maintainer's 0.1.0.61 verdict:
++		 * "for fps, get rid of 'fps' in the text for both ios and visionos
++		 * versions"). Both sibling ports draw a bare number in the same corner
++		 * (vkQuake ios/shell/ios_touch.m:1574, quake3e ios/shell/AppShell.m:41),
++		 * and q2repro's settings spec states it as a requirement. On a phone
++		 * panel and on the 3D panel alike, three characters of label on a
++		 * two-character reading is most of the counter.
++		 */
++		const char *s = va( "%i", fps );
+ 		const float w = strlen( s ) * charWidth;
+ 
+-		Con_DrawSizedStringExt( SCREEN_WIDTH - charWidth * 0.5f - w, y + SCR_DiagnosticTextTopPadding(), charWidth, charHeight, s, colorWhite, true );
++		// SCR_DrawFPS writes its own coordinates and does NOT go through
++		// SCR_DrawTextRightAlign, which is why insetting that function alone
++		// once moved everything except the counter itself.
++		float fpsLeft = 0.0f, fpsTop = 0.0f;
++		if ( SCR_DiagnosticOrigin( fpsLeft, fpsTop ) ) {
++			Con_DrawSizedStringExt( fpsLeft, y + fpsTop + SCR_DiagnosticTextTopPadding(),
++					charWidth, charHeight, s, colorWhite, true );
++		} else {
++			Con_DrawSizedStringExt( SCREEN_WIDTH - charWidth * 0.5f - w,
++					y + SCR_DiagnosticTextTopPadding(), charWidth, charHeight, s, colorWhite, true );
++		}
+ 	}
+ 
+ 	return y + SCR_DiagnosticLineAdvance( charHeight );

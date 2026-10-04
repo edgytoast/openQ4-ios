@@ -1,0 +1,185 @@
+/*
+ * Localizable.strings (en) — the UIKit/SwiftUI shell's strings.
+ *
+ * The keys ARE the English text, so this table is what the app shows when no
+ * translation exists and is also the complete list a translator works from.
+ * scripts/check-localization.py collects every key the code can look up
+ * (OpenQ4_L call sites, the kSettings table, SwiftUI and App Intents literals)
+ * and fails if any of the four tables lacks one, maps it differently in en,
+ * changes its format specifiers, or carries a key nothing reads.
+ *
+ * The engine's own strings are NOT here: they are localised upstream in pak0
+ * (strings/*.lang, en/fr/it/es) and reached with #str_ ids.
+ *
+ * D-088 (slice 1, mechanism) and D-112 (slices 2-3: onboarding, row titles,
+ * options; the per-option prose too, flagged for a native reader).
+ */
+
+/* --- Settings sheet — section headers (kSettings.section; looked up by English name, localised at display) --- */
+"Aim" = "Aim";
+"Touch Controls" = "Touch Controls";
+"Display" = "Display";
+"Audio" = "Audio";
+"Gameplay" = "Gameplay";
+"Multiplayer" = "Multiplayer";
+"Demos" = "Demos";
+"Mods" = "Mods";
+"3D" = "3D";
+
+/* --- Settings sheet — row labels (kSettings.label) --- */
+"Look Sensitivity (Horizontal)" = "Look Sensitivity (Horizontal)";
+"Look Sensitivity (Vertical)" = "Look Sensitivity (Vertical)";
+"Invert Vertical Look" = "Invert Vertical Look";
+"Gyro Aim" = "Gyro Aim";
+"Gyro Sensitivity (Horizontal)" = "Gyro Sensitivity (Horizontal)";
+"Gyro Sensitivity (Vertical)" = "Gyro Sensitivity (Vertical)";
+"Invert Gyro Pitch" = "Invert Gyro Pitch";
+"Weapon Wheel Speed (Gamepad)" = "Weapon Wheel Speed (Gamepad)";
+"Customize Touch Layout…" = "Customize Touch Layout…";
+"Control Opacity" = "Control Opacity";
+"Haptics" = "Haptics";
+"Double-Tap Crouch" = "Double-Tap Crouch";
+"Touch Panels Directly" = "Touch Panels Directly";
+"Field of View" = "Field of View";
+"Brightness" = "Brightness";
+"Render Resolution" = "Render Resolution";
+"Anti-aliasing (SMAA)" = "Anti-aliasing (SMAA)";
+"FPS Counter" = "FPS Counter";
+"Game Volume" = "Game Volume";
+"Music Volume" = "Music Volume";
+"Other App Audio" = "Other App Audio";
+"Always Run" = "Always Run";
+"Extra Master Server" = "Extra Master Server";
+"Direct Connect Address" = "Direct Connect Address";
+"Connect…" = "Connect…";
+"Record Demo" = "Record Demo";
+"Active Mod" = "Active Mod";
+
+/* --- Settings sheet — 3D section rows (visionOS, D-101/D-106) --- */
+"Screen Distance" = "Screen Distance";
+"Screen Width" = "Screen Width";
+"Screen Height" = "Screen Height";
+"Screen Position Height" = "Screen Position Height";
+"Stereo Depth" = "Stereo Depth";
+"Crosshair Distance" = "Crosshair Distance";
+"Panel Resolution" = "Panel Resolution";
+"Surroundings Dimming" = "Surroundings Dimming";
+"FPS on Panel" = "FPS on Panel";
+"Units" = "Units";
+"Recenter Screen" = "Recenter Screen";
+"3D Settings" = "3D Settings";
+"Reset" = "Reset";
+"m" = "m";
+"ft" = "ft";
+"Playing in 3D" = "Playing in 3D";
+"Exit" = "Exit";
+
+/* --- Settings sheet — option titles (pushed pickers and segments) --- */
+"50%" = "50%";
+"66%" = "66%";
+"75%" = "75%";
+"85%" = "85%";
+"Native (100%)" = "Native (100%)";
+"Lower Other Audio" = "Lower Other Audio";
+"Play Both" = "Play Both";
+"Stop Other Audio" = "Stop Other Audio";
+"Lower Game Audio" = "Lower Game Audio";
+"Mute Game Audio" = "Mute Game Audio";
+"Off" = "Off";
+"On" = "On";
+"Auto" = "Auto";
+"Fire Only" = "Fire Only";
+"While Aiming" = "While Aiming";
+"Always" = "Always";
+"On screen" = "On screen";
+"None (base game)" = "None (base game)";
+
+/* --- Settings sheet — one sentence per picker option (slice 4 prose, machine-translated; a native reader should check these first) --- */
+"Quarter the pixels. Longest battery life, softest image." = "Quarter the pixels. Longest battery life, softest image.";
+"Two thirds. A large frame-rate gain for a visible softening." = "Two thirds. A large frame-rate gain for a visible softening.";
+"Three quarters." = "Three quarters.";
+"Barely distinguishable from native, with real headroom back." = "Barely distinguishable from native, with real headroom back.";
+"Renders at the display's full resolution. The default." = "Renders at the display's full resolution. The default.";
+"Music or a podcast keeps playing, quieter, while the game plays over it." = "Music or a podcast keeps playing, quieter, while the game plays over it.";
+"Both play at full volume. Useful with your own soundtrack." = "Both play at full volume. Useful with your own soundtrack.";
+"Starting the game stops whatever else was playing." = "Starting the game stops whatever else was playing.";
+"The game drops to the background while something else is playing. Your music stays at full volume." = "The game drops to the background while something else is playing. Your music stays at full volume.";
+"The game goes silent while something else is playing, and comes back when it stops." = "The game goes silent while something else is playing, and comes back when it stops.";
+"The floor. Use this if the picture stutters at all." = "The floor. Use this if the picture stutters at all.";
+"A modest saving over the default." = "A modest saving over the default.";
+"The default. 120 fps measured here in the opening map." = "The default. 120 fps measured here in the opening map.";
+"Sharpest, and about 25% more work per eye. Watch the frame rate." = "Sharpest, and about 25% more work per eye. Watch the frame rate.";
+"No haptic feedback." = "No haptic feedback.";
+"A small tap on every button press." = "A small tap on every button press.";
+"A tap on the fire button only — useful there, noise elsewhere." = "A tap on the fire button only — useful there, noise elsewhere.";
+"The device's motion is ignored." = "The device's motion is ignored.";
+"Only while a finger is down on the look area — coarse aim with the thumb, fine aim with the wrist." = "Only while a finger is down on the look area — coarse aim with the thumb, fine aim with the wrist.";
+"Whenever you are in a map. Off in menus and cutscenes either way." = "Whenever you are in a map. Off in menus and cutscenes either way.";
+"Quake 4 exactly as it shipped." = "Quake 4 exactly as it shipped.";
+
+/* --- Settings sheet — chrome, alerts, the mod notice --- */
+"openQ4 Settings" = "openQ4 Settings";
+"Done" = "Done";
+"Back" = "Back";
+"OK" = "OK";
+"Stop Recording" = "Stop Recording";
+"host:port" = "host:port";
+"No address" = "No address";
+"Type a server address in the row above first." = "Type a server address in the row above first.";
+"No mods found. Copy a mod folder — the one containing mod.json — into the openQ4 folder in Files, next to q4base, then come back. Mods that ship their own game code cannot run on iOS." = "No mods found. Copy a mod folder — the one containing mod.json — into the openQ4 folder in Files, next to q4base, then come back. Mods that ship their own game code cannot run on iOS.";
+"A mod is applied the next time openQ4 starts." = "A mod is applied the next time openQ4 starts.";
+"openQ4 will start as the base game next time." = "openQ4 will start as the base game next time.";
+"%@ will be loaded the next time openQ4 starts." = "%@ will be loaded the next time openQ4 starts.";
+"Takes effect on next launch" = "Takes effect on next launch";
+"Quit openQ4 (swipe it away from the app switcher) and open it again." = "Quit openQ4 (swipe it away from the app switcher) and open it again.";
+
+/* --- Touch overlay — accessibility labels of the icon-only buttons --- */
+"Menu" = "Menu";
+"Objectives" = "Objectives";
+"Settings" = "Settings";
+"Reset Layout" = "Reset Layout";
+"Save Layout" = "Save Layout";
+
+/* --- Onboarding (first run, before the engine exists) --- */
+"openQ4 needs your own copy of Quake 4.\n\nCopy the game's q4base folder into this app's folder using the Files app, or tap below to choose it directly.\n\nQuake 4 from Steam or GOG already includes the 1.4.2 patch that openQ4 requires." = "openQ4 needs your own copy of Quake 4.\n\nCopy the game's q4base folder into this app's folder using the Files app, or tap below to choose it directly.\n\nQuake 4 from Steam or GOG already includes the 1.4.2 patch that openQ4 requires.";
+"Choose Quake 4 Folder" = "Choose Quake 4 Folder";
+"I Added Files — Check Again" = "I Added Files — Check Again";
+"Start openQ4" = "Start openQ4";
+"Folder could not be read." = "Folder could not be read.";
+"No Quake 4 pak files here. Pick the folder that contains pak001.pk4 … pak022.pk4 (usually called q4base)." = "No Quake 4 pak files here. Pick the folder that contains pak001.pk4 … pak022.pk4 (usually called q4base).";
+"That folder has no .pk4 files. Choose the folder containing pak001.pk4 … pak022.pk4 (usually q4base)." = "That folder has no .pk4 files. Choose the folder containing pak001.pk4 … pak022.pk4 (usually q4base).";
+"Two files in that folder differ only in capital letters: %@ and %@. Keep one of them and choose the folder again." = "Two files in that folder differ only in capital letters: %@ and %@. Keep one of them and choose the folder again.";
+"This looks like an unpatched Quake 4 (%d of 22 paks). openQ4 needs the 1.4.2 patch — Steam and GOG copies already include it. Missing: %@" = "This looks like an unpatched Quake 4 (%d of 22 paks). openQ4 needs the 1.4.2 patch — Steam and GOG copies already include it. Missing: %@";
+"Incomplete: %d of 22 required paks. Missing: %@" = "Incomplete: %d of 22 required paks. Missing: %@";
+"All 22 required paks found." = "All 22 required paks found.";
+"Mission-pack maps included." = "Mission-pack maps included.";
+"%d language pack(s)." = "%d language pack(s).";
+"Not enough free space. Importing needs %.1f GB and this device has %.1f GB free." = "Not enough free space. Importing needs %.1f GB and this device has %.1f GB free.";
+"Copying %@\n%.1f of %.1f GB" = "Copying %@\n%.1f of %.1f GB";
+"Copy failed on %@:\n%@" = "Copy failed on %@:\n%@";
+"(%d file name(s) lowercased for this device.)" = "(%d file name(s) lowercased for this device.)";
+"There is no q4base folder in the openQ4 folder yet." = "There is no q4base folder in the openQ4 folder yet.";
+"Put the q4base folder directly inside the openQ4 folder in Files." = "Put the q4base folder directly inside the openQ4 folder in Files.";
+"The last import was interrupted before it finished, so none of it was kept. Choose the folder again." = "The last import was interrupted before it finished, so none of it was kept. Choose the folder again.";
+"Starting..." = "Starting...";
+
+/* --- App Intents (Shortcuts / Spotlight, D-112). Shortcut PHRASES are English-only: they localise through a separate AppShortcuts.strings --- */
+"Play Quake 4" = "Play Quake 4";
+"Opens openQ4." = "Opens openQ4.";
+"Continue" = "Continue";
+"Loads your most recent save, or opens openQ4 if there is none." = "Loads your most recent save, or opens openQ4 if there is none.";
+"Load Map" = "Load Map";
+"Starts a map by name, for example game/airdefense1 or mp/q4dm1." = "Starts a map by name, for example game/airdefense1 or mp/q4dm1.";
+"Map" = "Map";
+"Which map?" = "Which map?";
+
+/* --- Engine save dialog + Load Game list tag (D-114; OpenQ4_iOS_SaveText, shown by the engine's own message box) --- */
+"Old version" = "Old version";
+"Cannot Load Save" = "Cannot Load Save";
+"This save was made by an older version of openQ4 and cannot be restored. Start %s again from the beginning, with the weapons and armor you had? This replaces the level's autosave; a copy of it is kept in the list." = "This save was made by an older version of openQ4 and cannot be restored. Start %s again from the beginning, with the weapons and armor you had? This replaces the level's autosave; a copy of it is kept in the list.";
+"Before restart" = "Before restart";
+"The level was not restarted: a copy of its autosave could not be kept, so nothing was changed. If Load Game already lists nine \"Before restart\" copies of this level, delete one and try again." = "The level was not restarted: a copy of its autosave could not be kept, so nothing was changed. If Load Game already lists nine \"Before restart\" copies of this level, delete one and try again.";
+"This save was made on a different kind of device and cannot be loaded here." = "This save was made on a different kind of device and cannot be loaded here.";
+"The level this save needs is not installed." = "The level this save needs is not installed.";
+"This save is damaged or incomplete and cannot be loaded." = "This save is damaged or incomplete and cannot be loaded.";
+"This save was made by an older version of openQ4 and cannot be restored." = "This save was made by an older version of openQ4 and cannot be restored.";

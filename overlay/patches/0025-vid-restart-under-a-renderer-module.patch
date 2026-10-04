@@ -1,0 +1,62 @@
+--- a/src/renderer/RenderSystem_init.cpp
++++ b/src/renderer/RenderSystem_init.cpp
+@@ -4616,6 +4616,42 @@
+ 		if ( idStr::Icmp( args.Argv( i ), "windowed" ) == 0 ) {
+ 			forceWindow = true;
+ 			continue;
++		}
++	}
++
++	/*
++	 * A FULL restart is a GL-only flow, and under a renderer MODULE it is
++	 * fatal (openQ4-ios D-091).
++	 *
++	 * R_PerformFullVidRestart calls R_InitOpenGL, whose second act is
++	 * GLimp_Init. Under the Vulkan backend that symbol is one of
++	 * src/renderer/Vulkan/vk_Backend.cpp's "residual link surface" stubs — it
++	 * warns "GLimp_Init reached under the Vulkan backend" and returns false —
++	 * so R_InitOpenGL retries once and then calls
++	 * common->FatalError( "Unable to initialize OpenGL" ). The process dies,
++	 * from the console command that is supposed to REstart the renderer. That
++	 * file's own comment says "R_InitOpenGL and the GL vid-restart flow stay
++	 * compiled but unreachable under the Vulkan seam"; this path is how they
++	 * are reachable.
++	 *
++	 * The PARTIAL flow is implemented there (GLimp_SetScreenParms ->
++	 * ApplyScreenParms + VK_Device_RecreateSwapchain), and it does everything a
++	 * restart means for a module renderer: the device re-applies the window
++	 * parameters and rebuilds the swapchain, and the common tail below still
++	 * bumps videoRestartCount and regenerates the world. So a module renderer
++	 * takes it, loudly, instead of taking a flow that cannot work.
++	 *
++	 * Deliberately NOT platform-gated: this kills the macOS oracle at
++	 * `r_renderApi vulkan` exactly as it killed the iPhone and the Vision Pro.
++	 * Upstreaming candidate.
++	 */
++	if ( full ) {
++		const rendererModuleStatus_t &rmStatus = R_RendererModule_GetStatus();
++		if ( rmStatus.activeApi != RENDER_MODULE_API_GL ) {
++			common->Printf( "vid_restart: the '%s' renderer has no full-restart path; "
++					"restarting the render device instead\n",
++					R_RendererModule_ApiName( rmStatus.activeApi ) );
++			full = false;
+ 		}
+ 	}
+ 
+@@ -4653,8 +4689,16 @@
+ 		parms.multiSamples = r_multiSamples.GetInteger();
+ 		parms.stereo = false;
+ 		if ( !GLimp_SetScreenParms( parms ) ) {
++			// Same reason as above: for a module renderer the full flow is a
++			// FatalError, so a failed partial restart must stay a warning
++			// rather than escalate into killing the process.
++			if ( R_RendererModule_GetStatus().activeApi != RENDER_MODULE_API_GL ) {
++				common->Warning( "vid_restart: the render device refused the new screen "
++						"parameters; the renderer is unchanged" );
++			} else {
+ 			common->Printf( "^3vid_restart partial failed, retrying full restart\n" );
+ 			R_PerformFullVidRestart( forceWindow );
++			}
+ 		} else {
+ 			(void)R_ClearPendingGLErrors();
+ 			// The context survived, but a mode change can alter the UI viewport.

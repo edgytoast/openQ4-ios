@@ -1,0 +1,26 @@
+# openQ4 upstream pins — the engine and game repos are pinned AS A PAIR.
+# The game API version couples them; never bump one alone.
+# Bump procedure: scripts/bump-pin.sh <tag> — moves both vendor clones and the
+# macOS oracle, rebuilds the oracle's baseoq4 packs, rewrites the key lines
+# below and re-applies the overlay (failing loudly on any patch that no longer
+# applies). See DECISIONS.md D-001 and D-110.
+
+OPENQ4_REPO=https://github.com/themuffinator/openQ4
+OPENQ4_REF=v0.13.2
+OPENQ4_COMMIT=fcdd56967135fbbdfb1688e2d25533f8f123b1c6
+OPENQ4_DATE=2026-09-14
+OPENQ4_DESC=Stop a gui var transition aborting the save that catches it
+
+OPENQ4_GAME_REPO=https://github.com/themuffinator/openQ4-game
+OPENQ4_GAME_COMMIT=8f411dbc38efcb0f5f63b1c300ab220beb73808c
+OPENQ4_GAME_DATE=2026-09-13
+
+# Pin rationale (D-110): pinned to a release TAG, as the charter prefers.
+# openQ4-game has no tags; the companion commit is the OPENQ4_GAMELIBS_SHA the
+# tagged engine commit's own CI builds against
+# (.github/workflows/push-verification.yml), which for a release tag is also the
+# revision the release workflow resolved and shipped (cross-checked against the
+# release run's log). bump-pin.sh reads it from there unless given explicitly.
+#
+# History: D-001/D-003 pinned 227ee810 (main, past v0.9.0) for the Arena
+# Campaign; D-110 moved to v0.13.2.

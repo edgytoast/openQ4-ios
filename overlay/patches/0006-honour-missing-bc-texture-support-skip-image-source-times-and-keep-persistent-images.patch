@@ -1,0 +1,197 @@
+--- a/src/renderer/Image_load.cpp
++++ b/src/renderer/Image_load.cpp
+@@ -28,6 +28,9 @@
+ 
+ 
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#endif
+ #include "tr_local.h"
+ 
+ /*
+@@ -190,8 +193,18 @@
+ ID_INLINE void idImage::DeriveOpts() {
+ 
+ 	if ( usage == TD_FONT ) {
+-		opts.format = FMT_DXT1;
+-		opts.colorFormat = CFM_GREEN_ALPHA;
++		// Font atlases hard-coded FMT_DXT1 with an early return, skipping the
++		// glConfig.textureCompressionAvailable check the very next branch makes.
++		// On a GPU without BC (the iOS simulator) that produces an unsupported
++		// VK_FORMAT_BC1_RGBA_UNORM_BLOCK and a Metal validation abort during
++		// renderer init — before anything is ever drawn.
++		//
++		// CFM_GREEN_ALPHA is a DXT-era packing trick (alpha copied into green);
++		// uncompressed RGBA8 needs no such packing, so the colour format goes
++		// back to default alongside it.
++		const bool fontCompressed = glConfig.textureCompressionAvailable;
++		opts.format = fontCompressed ? FMT_DXT1 : FMT_RGBA8;
++		opts.colorFormat = fontCompressed ? CFM_GREEN_ALPHA : CFM_DEFAULT;
+ 		opts.numLevels = 4; // Retail Quake 4's generated font-atlas path keeps four mip levels.
+ 		opts.gammaMips = true;
+ 		return;
+@@ -496,6 +509,34 @@
+ 	}
+ }
+ 
++/*
++ * image_skipSourceTimeChecks — the image half of com_productionMode, and only
++ * that half (openQ4-ios D-109).
++ *
++ * Production mode skips every image SOURCE-timestamp revalidation: the image
++ * program re-parse and source stat that prove a cached generated/ image is not
++ * older than its source, and the one that proves a preferred DDS is not older
++ * than the TGA it replaces. On the iOS simulator that was ~4.6 s of a map load.
++ * But com_productionMode also makes the generated-cache accept test skip
++ * R_GeneratedImageHeaderMatchesDerivedOpts (any supported header is taken, even
++ * one built for another size or format — a quality-preset change would then be
++ * served the old cache), and that is not a timestamp check. This cvar takes the
++ * timestamp skips and leaves the header match alone.
++ *
++ * Staleness is then the caller's job: the iOS shell wipes generated/ whenever
++ * the executable, the active mod or the set of pk4s changes, and turns this off
++ * outright whenever user content beyond retail is present (a mod, an extra pk4,
++ * loose files), because a TGA override older than nothing still has to beat a
++ * retail DDS and only the timestamp check knows that.
++ */
++static idCVar image_skipSourceTimeChecks( "image_skipSourceTimeChecks", "0", CVAR_RENDERER | CVAR_BOOL,
++	"skip image source-timestamp revalidation (cached generated images and preferred DDS staleness); "
++	"the caller guarantees the cache is fresh" );
++
++static bool R_SkipImageSourceTimeChecks() {
++	return fileSystem->InProductionMode() || image_skipSourceTimeChecks.GetBool();
++}
++
+ static bool R_IsPreferredDDSStale( const idStr &preferredDDSName, ID_TIME_T preferredDDSFileTime, ID_TIME_T originalSourceTime ) {
+ 	if ( originalSourceTime == FILE_NOT_FOUND_TIMESTAMP || preferredDDSFileTime >= originalSourceTime ) {
+ 		return false;
+@@ -516,7 +557,17 @@
+ On exit, the idImage will have a valid OpenGL texture number that can be bound
+ ===============
+ */
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++extern "C" void OpenQ4_iOS_SetActivity( const char *what );
++#endif
++
+ void idImage::ActuallyLoadImage( bool fromBackEnd ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Sampled once a second by the watchdog. Image loading is the bulk of both
++	// startup and map load and prints nothing, so without this the time cannot
++	// be attributed to anything at all.
++	OpenQ4_iOS_SetActivity( imgName.c_str() );
++#endif
+ 
+ 	// if we don't have a rendering context yet, just return
+ 	if ( !tr.IsOpenGLRunning() ) {
+@@ -543,7 +594,7 @@
+ 	bool sourceFileTimeKnown = false;
+ 	// read through the cvar system rather than the framework-owned idCVar
+ 	// object so this file stays linkable inside a renderer module
+-	if ( cvarSystem->GetCVarInteger( "com_productionMode" ) != 0 ) {
++	if ( cvarSystem->GetCVarInteger( "com_productionMode" ) != 0 || image_skipSourceTimeChecks.GetBool() ) {
+ 		sourceFileTime = FILE_NOT_FOUND_TIMESTAMP;
+ 		sourceFileTimeKnown = true;
+ 		if ( cubeFiles != CF_2D ) {
+@@ -585,7 +636,7 @@
+ 	bool preferredDDSImage = !explicitDDSImage &&
+ 		cubeFiles == CF_2D &&
+ 		R_ResolvePreferredDDSImageSource( GetName(), preferredDDSName, &preferredDDSFileTime, true, &preferredDDSPrecompressed );
+-	if ( preferredDDSImage && !fileSystem->InProductionMode() ) {
++	if ( preferredDDSImage && !R_SkipImageSourceTimeChecks() ) {
+ 		ID_TIME_T originalSourceTime = FILE_NOT_FOUND_TIMESTAMP;
+ 		{
+ 			idScopedImageLoadPhase probePhase( imageLoadPhaseTimings.probeMsec, imageLoadPhaseTimings.probeCount );
+@@ -607,8 +658,24 @@
+ 	if ( preferredDDSImage && cvarSystem->GetCVarBool( "image_showPrecompressedTextures" ) ) {
+ 		common->Printf( "Using DDS replacement %s for %s\n", preferredDDSName.c_str(), GetName() );
+ 	}
+-	const bool selectedDDSImage = explicitDDSImage || preferredDDSImage;
+-	const bool bypassGeneratedFile = explicitDDSImage || preferredDDSPrecompressed;
++	// A GPU that reports no BC/DXT support cannot accept a compressed DDS at
++	// all. image_usePrecompressedTextures gates the *preferred* DDS lookup, but
++	// an EXPLICIT .dds reference bypasses it — and openQ4's own baseoq4 content
++	// references DDS explicitly. Uploading one anyway produces
++	// VK_ERROR_FORMAT_NOT_SUPPORTED and then a Metal validation abort, which is
++	// how the iOS simulator (no BC) dies during renderer init.
++	//
++	// Both the retail assets and openQ4's own packs ship the uncompressed
++	// source beside the DDS, so declining the DDS path here falls through to
++	// the normal image program and still produces the right image.
++	const bool ddsUsable = glConfig.textureCompressionAvailable;
++	if ( !ddsUsable && ( explicitDDSImage || preferredDDSImage ) ) {
++		if ( cvarSystem->GetCVarBool( "image_showPrecompressedTextures" ) ) {
++			common->Printf( "Skipping DDS for %s: no BC texture compression on this device\n", GetName() );
++		}
++	}
++	const bool selectedDDSImage = ddsUsable && ( explicitDDSImage || preferredDDSImage );
++	const bool bypassGeneratedFile = ddsUsable && ( explicitDDSImage || preferredDDSPrecompressed );
+ 	idStr selectedSourceName = GetName();
+ 	if ( preferredDDSImage ) {
+ 		selectedSourceName = preferredDDSName;
+@@ -688,7 +755,9 @@
+ 		if ( candidateFileTime == FILE_NOT_FOUND_TIMESTAMP ) {
+ 			return false;
+ 		}
+-		if ( !productionMode ) {
++		// openQ4-ios D-109: the timestamp half only (production mode OR
++		// image_skipSourceTimeChecks); the header match below stays on productionMode.
++		if ( !R_SkipImageSourceTimeChecks() ) {
+ 			if ( !sourceFileTimeKnown ) {
+ 				idScopedImageLoadPhase probePhase( imageLoadPhaseTimings.probeMsec, imageLoadPhaseTimings.probeCount );
+ 				if ( cubeFiles != CF_2D ) {
+@@ -1745,6 +1814,27 @@
+ void idImage::Reload( bool force ) {
+ 	// always regenerate functional images
+ 	if ( generatorFunction ) {
++		// openQ4-ios D-111: ... except the placeholders that stand in for
++		// runtime render targets (Image_intrinsic.cpp: "placeholders for
++		// runtime render targets referenced by materials", plus the capture
++		// targets). Their generator re-creates a 16x16 placeholder over the
++		// target its owner sized at runtime, and an owner that only
++		// reallocates when ITS idea of the size changes then renders into the
++		// placeholder: on visionOS the whole world went black after
++		// `reloadImages`. A loaded one keeps its live storage.
++		static const char *const kRuntimeTargets[] = {
++			"_currentRender", "_currentDepth", "_forwardRenderResolvedAlbedo",
++			"_forwardRenderResolvedDepth", "_postProcessAlbedo0", "_postProcessAlbedo1",
++			"_postProcessAlbedo2", "_scratch", "_scratch2", "_accum",
++			"_reflectionRender", "_refractionRender",
++		};
++		if ( IsLoaded() ) {
++			for ( int i = 0; i < (int)( sizeof( kRuntimeTargets ) / sizeof( kRuntimeTargets[0] ) ); i++ ) {
++				if ( imgName.Icmp( kRuntimeTargets[i] ) == 0 ) {
++					return;
++				}
++			}
++		}
+ 		common->DPrintf( "regenerating %s.\n", GetName() );
+ 		generatorFunction( this );
+ 		return;
+@@ -1752,6 +1842,17 @@
+ 
+ 	// persistent images are runtime render targets, not file-backed
+ 	if ( opts.isPersistant ) {
++		// openQ4-ios D-111: and not only render targets. The TTF glyph atlases
++		// (_ttfatlas*, _ttfconsolefont) are persistent images written ONCE by
++		// R_TTFPackAtlas, which frees its pixels afterwards; reallocating them
++		// here left empty (on Vulkan: UNDEFINED-layout) textures behind, and
++		// every TTF string drew as a magenta block after `reloadImages` or a
++		// texture-quality change. A persistent image that already has storage
++		// is kept; its owner reallocates it itself (ScratchImage) whenever its
++		// size or format really changes.
++		if ( IsLoaded() ) {
++			return;
++		}
+ 		common->DPrintf( "reallocating persistent %s.\n", GetName() );
+ 		DeriveOpts();
+ 		AllocImage();
+@@ -1773,7 +1874,7 @@
+ 			if ( idStr::Icmp( sourceExtension.c_str(), "dds" ) != 0 &&
+ 				 R_ResolvePreferredDDSImageSource( imgName, preferredDDSName, &preferredDDSFileTime, true, NULL ) ) {
+ 				ID_TIME_T originalSourceTime = FILE_NOT_FOUND_TIMESTAMP;
+-				if ( !fileSystem->InProductionMode() ) {
++				if ( !R_SkipImageSourceTimeChecks() ) {
+ 					R_LoadImageProgram( imgName, NULL, NULL, NULL, &originalSourceTime );
+ 				}
+ 				if ( R_IsPreferredDDSStale( preferredDDSName, preferredDDSFileTime, originalSourceTime ) ) {

@@ -1,0 +1,31 @@
+--- a/src/sound/snd_emitter.cpp
++++ b/src/sound/snd_emitter.cpp
+@@ -28,6 +28,12 @@
+ ===========================================================================
+ */
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++extern "C" float openQ4_iOSDuckGain( void );
++#endif
++#endif
+ #include "snd_local.h"
+ 
+ idCVar s_singleEmitter( "s_singleEmitter", "0", CVAR_INTEGER, "mute all sounds but this emitter" );
+@@ -585,6 +591,15 @@
+ 	}
+ 
+ 	volumeScale *= SoundSanitizeGainScale( s_volume.GetFloat(), 0.0f );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// "Lower Game Audio" / "Mute Game Audio" attenuate OUR mix, because iOS has
++	// no session option for them — it will duck other apps for you, never
++	// itself. Deliberately a separate, NON-ARCHIVED gain rather than writing
++	// s_volume: s_volume is CVAR_ARCHIVE, so a ducked value would be saved on
++	// quit, become the base value next launch and be ducked again — a ratchet
++	// that walks the player's real volume down over days.
++	volumeScale *= openQ4_iOSDuckGain();
++#endif
+ 	volumeScale *= volumeFade.GetVolume( currentTime );
+ 	volumeScale *= soundWorld->volumeFade.GetVolume( currentTime );
+ 	volumeScale *= soundWorld->pauseFade.GetVolume( currentTime );

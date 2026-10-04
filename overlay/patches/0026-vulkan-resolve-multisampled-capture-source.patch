@@ -1,0 +1,135 @@
+--- a/src/renderer/Vulkan/vk_Image.cpp
++++ b/src/renderer/Vulkan/vk_Image.cpp
+@@ -324,6 +324,109 @@
+ 	vkSamplers[ vkNumSamplers ] = sampler;
+ 	vkNumSamplers++;
+ 	return sampler;
++}
++
++/*
++====================
++VK_Image_AcquireResolveScratch
++
++vkCmdBlitImage cannot read a multisampled source, so a capture taken while the
++scene renders into an MSAA target has to be resolved first. vkCmdResolveImage
++demands a destination of the source's exact format with one sample, and the
++_currentRender destination is R_RGBA16F regardless of the scene format, so the
++resolve needs its own storage: this image. It is also the blit's source, hence
++TRANSFER_SRC as well as TRANSFER_DST. Kept here with the rest of the image
++storage so ShutdownAll retires it (openQ4-ios D-094).
++====================
++*/
++static vkImageEntry_t vkResolveScratch;
++
++static void VK_Image_ReleaseResolveScratch( bool deferred ) {
++	if ( vkResolveScratch.image != VK_NULL_HANDLE ) {
++		if ( deferred ) {
++			VK_Device_DeferDestroy( vkResolveScratch.image, VK_NULL_HANDLE,
++					VK_NULL_HANDLE, vkResolveScratch.allocation, VK_NULL_HANDLE );
++		} else if ( vkCtx.allocator != NULL ) {
++			vmaDestroyImage( vkCtx.allocator, vkResolveScratch.image,
++					vkResolveScratch.allocation );
++		}
++	}
++	memset( &vkResolveScratch, 0, sizeof( vkResolveScratch ) );
++}
++
++vkImageEntry_t *VK_Image_AcquireResolveScratch( int width, int height,
++		VkFormat format ) {
++	if ( !vkCtx.initialized || width <= 0 || height <= 0
++			|| format == VK_FORMAT_UNDEFINED ) {
++		return NULL;
++	}
++	if ( vkResolveScratch.image != VK_NULL_HANDLE
++			&& vkResolveScratch.width == width
++			&& vkResolveScratch.height == height
++			&& vkResolveScratch.format == format ) {
++		return &vkResolveScratch;
++	}
++	// A size or format change retires the old storage through the deferred
++	// queue: an in-flight frame may still be reading it.
++	VK_Image_ReleaseResolveScratch( true );
++
++	const VkImageUsageFlags usage =
++			VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++
++	VkImageCreateInfo ici;
++	memset( &ici, 0, sizeof( ici ) );
++	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++	ici.imageType = VK_IMAGE_TYPE_2D;
++	ici.format = format;
++	ici.extent.width = (uint32_t)width;
++	ici.extent.height = (uint32_t)height;
++	ici.extent.depth = 1;
++	ici.mipLevels = 1;
++	ici.arrayLayers = 1;
++	ici.samples = VK_SAMPLE_COUNT_1_BIT;
++	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++	ici.usage = usage;
++	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++	VmaAllocationCreateInfo vaci;
++	memset( &vaci, 0, sizeof( vaci ) );
++	vaci.usage = VMA_MEMORY_USAGE_AUTO;
++
++	VkImage newImage = VK_NULL_HANDLE;
++	VmaAllocation newAllocation = NULL;
++	if ( vmaCreateImage( vkCtx.allocator, &ici, &vaci,
++			&newImage, &newAllocation, NULL ) != VK_SUCCESS ) {
++		static bool warnedCreate = false;
++		if ( !warnedCreate ) {
++			warnedCreate = true;
++			common->Warning( "Vulkan: capture resolve scratch creation failed (%dx%d fmt %d)",
++					width, height, (int)format );
++		}
++		memset( &vkResolveScratch, 0, sizeof( vkResolveScratch ) );
++		return NULL;
++	}
++
++	vkResolveScratch.image = newImage;
++	vkResolveScratch.allocation = newAllocation;
++	vkResolveScratch.view = VK_NULL_HANDLE;
++	vkResolveScratch.attachmentView = VK_NULL_HANDLE;
++	vkResolveScratch.sampler = VK_NULL_HANDLE;
++	vkResolveScratch.format = format;
++	vkResolveScratch.usage = usage;
++	vkResolveScratch.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++	vkResolveScratch.layout = VK_IMAGE_LAYOUT_UNDEFINED;
++	vkResolveScratch.samples = VK_SAMPLE_COUNT_1_BIT;
++	vkResolveScratch.width = width;
++	vkResolveScratch.height = height;
++	vkResolveScratch.numMips = 1;
++	vkResolveScratch.numLayers = 1;
++	vkResolveScratch.isCube = false;
++	vkResolveScratch.everUploaded = false;
++	// Never sampled and never in the image table, so it needs no slot and no
++	// descriptor generation of its own.
++	vkResolveScratch.inUse = false;
++	vkResolveScratch.generation = 0;
++	return &vkResolveScratch;
+ }
+ 
+ /*
+@@ -351,6 +454,7 @@
+ 		}
+ 		memset( &vkImages[ i ], 0, sizeof( vkImages[ i ] ) );
+ 	}
++	VK_Image_ReleaseResolveScratch( false );
+ 	for ( int i = 0; i < vkNumSamplers; i++ ) {
+ 		vkDestroySampler( vkCtx.device, vkSamplers[ i ], NULL );
+ 	}
+--- a/src/renderer/Vulkan/vk_Image.h
++++ b/src/renderer/Vulkan/vk_Image.h
+@@ -51,6 +51,12 @@
+ // dimensions in sync with the copied region.
+ bool	VK_Image_MakeDepthCopyTarget( idImage *image, int width, int height,
+ 			VkFormat depthFormat );
++// Single-sample scratch storage of the source's exact format, used to resolve
++// a multisampled scene target before the format-converting _currentRender
++// feedback blit (openQ4-ios D-094). One image, reused every frame, recreated
++// when the render target changes size or format, retired by ShutdownAll.
++vkImageEntry_t *VK_Image_AcquireResolveScratch( int width, int height,
++			VkFormat format );
+ void	VK_Image_ShutdownAll( void );
+ 
+ #endif /* !__VK_IMAGE_H__ */

@@ -1,0 +1,735 @@
+--- a/src/framework/FileSystem.cpp
++++ b/src/framework/FileSystem.cpp
+@@ -1582,7 +1582,65 @@
+ private:
+ 	void					ReplaceSeparators( idStr &path, char sep = PATHSEPERATOR_CHAR );
+ 	bool					FindCaseInsensitiveOSPathEntry( const char *directory, const char *segment, bool directoryOnly, idStr &resolvedSegment );
++	/*
++	 * Cached directory listings for case-insensitive path resolution.
++	 *
++	 * On a case-sensitive filesystem every fopen that misses falls back to
++	 * resolving the path segment by segment, and each segment listed its parent
++	 * directory afresh. That is one full directory enumeration per failed open —
++	 * and the renderer's DDS resolver deliberately probes 8-12 candidate paths
++	 * per image, most of which are MEANT to miss. On an iPhone, sampling the
++	 * main thread during startup landed in Sys_ListFiles under this resolver
++	 * every single time.
++	 *
++	 * The listing for a directory does not change while the game reads it, so it
++	 * is cached and invalidated whenever anything is opened for writing.
++	 */
++	struct osDirCache_t {
++		idStr				key;			// directory + kind
++		idStrList			entries;		// names exactly as they are on disk
++		idHashIndex			foldedHash;		// case-folded name -> index in entries
++	};
++	idList<osDirCache_t *>	osDirCaches;
++	idHashIndex				osDirCacheHash;
++	const osDirCache_t *	GetOSDirCache( const char *directory, bool directoryOnly );
++	void					InvalidateOSDirCache( void );
++	void					InvalidateOSDirCacheForFile( const char *osPath );
++	virtual void			InvalidateCachedOSPath( const char *osPath );
+ 	bool					ResolveCaseInsensitiveOSPath( const char *path, idStr &resolvedPath, bool finalSegmentIsFile );
++	/*
++	 * Resolved directories, keyed by the exact (normalized) spelling asked for.
++	 *
++	 * ResolveCaseInsensitiveOSPath used to stat every segment from "/" on each
++	 * call, and OpenOSFile calls it twice per missed fopen — about thirty
++	 * stat()s for every loose-file probe of an asset that lives in a pk4
++	 * (D-108). A directory's resolution is the same answer every time, so it
++	 * is memoized, parent first: a probe now costs one hash lookup for its
++	 * directory plus at most one stat for its final segment.
++	 *
++	 * Unlike upstream's 0dc6b260 existence cache this stores the case-resolved
++	 * spelling, so a directory that exists only in another casing still
++	 * resolves (case recovery for mods is the point of the resolver).
++	 *
++	 * Staleness: a "missing" answer can only become wrong when a directory is
++	 * created. Every engine-side creation goes through CreateOSPath, and every
++	 * engine write through InvalidateOSDirCacheForFile; both drop the negative
++	 * entries along that path and nothing else, so the generated-image writes
++	 * of a map load do not thrash the positive entries every probe shares
++	 * (the D-027 lesson). Filesystem startup clears the lot, which covers
++	 * directories made outside the engine (Files drops, onboarding import).
++	 */
++	struct osResolvedDir_t {
++		idStr				key;			// normalized spelling asked for
++		idStr				resolved;		// on-disk spelling ('/' separators)
++		bool				found;
++		bool				changed;		// resolved differs from key
++	};
++	idList<osResolvedDir_t *>	osResolvedDirs;
++	idHashIndex				osResolvedDirHash;
++	const osResolvedDir_t *	ResolveCaseInsensitiveOSDirectory( const idStr &normalizedDirectory );
++	void					ForgetMissingOSDirectories( const char *osPath );
++	void					ClearResolvedOSDirectories( void );
+ 	int						HashFileName( const char *fname ) const;
+ 	int						ListOSFiles( const char *directory, const char *extension, idStrList &list );
+ 	FILE *					OpenOSFile( const char *name, const char *mode, idStr *caseSensitiveName = NULL );
+@@ -1943,6 +2001,13 @@
+ ================
+ */
+ FILE *idFileSystemLocal::OpenOSFile( const char *fileName, const char *mode, idStr *caseSensitiveName ) {
++	// Any non-read mode can create a file and invalidate a cached listing —
++	// configs, savegames and the generated-image cache all land in fs_savepath
++	// mid-session. Dropping the whole cache is heavy-handed and correct; writes
++	// are rare next to the reads this exists to speed up.
++	if ( mode != NULL && strchr( mode, 'r' ) == NULL ) {
++		InvalidateOSDirCacheForFile( fileName );
++	}
+ 	int i;
+ 	FILE *fp;
+ 	idStr fpath, entry;
+@@ -1982,7 +2047,35 @@
+ 		idStr resolvedPath;
+ 		if ( ResolveCaseInsensitiveOSPath( fpath.c_str(), resolvedPath, false ) ) {
+ 			fpath = resolvedPath;
++		}
++		// Cached, like the segment resolver above. This second fallback is a
++		// separate uncached listing that the first cache did not cover, and
++		// sampling the maintainer's device found the main thread sitting in it under
++		// idDeclEntityDef::Parse — so it is hot on exactly the same paths.
++		{
++			idStr wantedName = fileName;
++			wantedName.StripPath();
++			idStr resolvedEntry;
++			if ( FindCaseInsensitiveOSPathEntry( fpath.c_str(), wantedName.c_str(), false, resolvedEntry ) ) {
++				entry = fpath + PATHSEPERATOR_CHAR + resolvedEntry;
++				fp = fopen( entry, mode );
++				if ( fp ) {
++					if ( caseSensitiveName ) {
++						*caseSensitiveName = entry;
++						caseSensitiveName->StripPath();
++					}
++					if ( fs_debug.GetInteger() ) {
++						common->Printf( "idFileSystemLocal::OpenFileRead: changed %s to %s\n", fileName, entry.c_str() );
++					}
++					return fp;
++				}
++			}
++			// The cache says the directory holds no such name in any casing.
++			// The uncached walk below could only reach the same conclusion, far
++			// more slowly, so stop here.
++			return NULL;
+ 		}
++
+ 		if ( ListOSFiles( fpath, NULL, list ) == -1 ) {
+ 			return NULL;
+ 		}
+@@ -2072,6 +2165,9 @@
+ 			*ofs = PATHSEPERATOR_CHAR;
+ 		}
+ 	}
++
++	// directories may just have appeared where the resolver recorded none
++	ForgetMissingOSDirectories( OSPath );
+ }
+ 
+ /*
+@@ -2171,10 +2267,100 @@
+ idFileSystemLocal::FindCaseInsensitiveOSPathEntry
+ ===================
+ */
+-bool idFileSystemLocal::FindCaseInsensitiveOSPathEntry( const char *directory, const char *segment, bool directoryOnly, idStr &resolvedSegment ) {
++void idFileSystemLocal::InvalidateOSDirCache( void ) {
++	osDirCaches.DeleteContents( true );
++	osDirCacheHash.Free();
++}
++
++/*
++===================
++idFileSystemLocal::InvalidateOSDirCacheForFile
++
++Drop only the directory the write actually touches.
++
++Invalidating everything looked conservative and was in fact ruinous: the engine
++writes generated images into fs_savepath continuously during a map load, so a
++whole-cache flush per write meant the game data listings were rebuilt from
++scratch between every pair of writes. The cache spent a map load thrashing, and
++the load stayed slow on device while looking fixed on the simulator.
++
++Written files live under fs_savepath; the listings that matter for reads are the
++game data directories, which no write ever touches.
++===================
++*/
++void idFileSystemLocal::InvalidateCachedOSPath( const char *osPath ) {
++	InvalidateOSDirCacheForFile( osPath );
++}
++
++void idFileSystemLocal::InvalidateOSDirCacheForFile( const char *osPath ) {
++	ForgetMissingOSDirectories( osPath );
++	if ( osPath == NULL || osPath[0] == '\0' || osDirCaches.Num() == 0 ) {
++		return;
++	}
++
++	idStr directory = osPath;
++	directory.StripFilename();
++	if ( directory.Length() == 0 ) {
++		directory = ".";
++	}
++
++	for ( int pass = 0; pass < 2; pass++ ) {
++		idStr key = directory;
++		key += ( pass == 0 ) ? "\n<files>" : "\n<dirs>";
++
++		const int hash = osDirCacheHash.GenerateKey( key.c_str(), false );
++		for ( int i = osDirCacheHash.First( hash ); i != -1; i = osDirCacheHash.Next( i ) ) {
++			if ( osDirCaches[i]->key.Cmp( key.c_str() ) != 0 ) {
++				continue;
++			}
++			// Emptying in place keeps every other index valid; a removal would
++			// shift them and corrupt the hash.
++			osDirCaches[i]->entries.Clear();
++			osDirCaches[i]->foldedHash.Clear();
++			osDirCacheHash.Remove( hash, i );
++			delete osDirCaches[i];
++			osDirCaches[i] = new osDirCache_t;
++			osDirCaches[i]->key = "\n<invalidated>";
++			break;
++		}
++	}
++}
++
++const idFileSystemLocal::osDirCache_t *idFileSystemLocal::GetOSDirCache( const char *directory, bool directoryOnly ) {
++	idStr key = directory;
++	// Files and directories are listed with different filters, so they cannot
++	// share an entry.
++	key += directoryOnly ? "\n<dirs>" : "\n<files>";
++
++	const int hash = osDirCacheHash.GenerateKey( key.c_str(), false );
++	for ( int i = osDirCacheHash.First( hash ); i != -1; i = osDirCacheHash.Next( i ) ) {
++		if ( osDirCaches[i]->key.Cmp( key.c_str() ) == 0 ) {
++			return osDirCaches[i];
++		}
++	}
++
+ 	idStrList entries;
++	if ( Sys_ListFiles( directory, directoryOnly ? "/" : "", entries ) == -1 ) {
++		// Cache the miss too: a directory that does not exist is probed just as
++		// often as one that does, and re-listing it every time is the same cost.
++		entries.Clear();
++	}
++
++	osDirCache_t *cache = new osDirCache_t;
++	cache->key = key;
++	cache->entries = entries;
++	cache->foldedHash.Clear( idMath::CeilPowerOfTwo( Max( 16, entries.Num() ) ), entries.Num() + 1 );
++	for ( int i = 0; i < entries.Num(); i++ ) {
++		cache->foldedHash.Add( cache->foldedHash.GenerateKey( entries[i].c_str(), false ), i );
++	}
++
++	const int index = osDirCaches.Append( cache );
++	osDirCacheHash.Add( hash, index );
++	return cache;
++}
++
++bool idFileSystemLocal::FindCaseInsensitiveOSPathEntry( const char *directory, const char *segment, bool directoryOnly, idStr &resolvedSegment ) {
+ 	const char *listDirectory = directory;
+-	const char *extension = directoryOnly ? "/" : "";
+ 
+ 	if ( !listDirectory || !listDirectory[0] ) {
+ 		listDirectory = ".";
+@@ -2184,23 +2370,30 @@
+ 		return false;
+ 	}
+ 
+-	if ( Sys_ListFiles( listDirectory, extension, entries ) == -1 ) {
++	const osDirCache_t *cache = GetOSDirCache( listDirectory, directoryOnly );
++	if ( cache == NULL || cache->entries.Num() == 0 ) {
+ 		return false;
+ 	}
+ 
+-	for ( int i = 0; i < entries.Num(); i++ ) {
+-		if ( entries[i].Cmp( segment ) == 0 ) {
+-			resolvedSegment = entries[i];
++	// idHashIndex::GenerateKey( str, false ) is already case-insensitive, so one
++	// bucket walk replaces the two full linear passes this used to make. Exact
++	// matches still win over case-folded ones, which is why both are checked
++	// within the bucket rather than returning the first hit.
++	const int hash = cache->foldedHash.GenerateKey( segment, false );
++	int foldedMatch = -1;
++	for ( int i = cache->foldedHash.First( hash ); i != -1; i = cache->foldedHash.Next( i ) ) {
++		if ( cache->entries[i].Cmp( segment ) == 0 ) {
++			resolvedSegment = cache->entries[i];
+ 			return true;
+ 		}
+-	}
+-
+-	for ( int i = 0; i < entries.Num(); i++ ) {
+-		if ( entries[i].Icmp( segment ) == 0 ) {
+-			resolvedSegment = entries[i];
+-			return true;
++		if ( foldedMatch == -1 && cache->entries[i].Icmp( segment ) == 0 ) {
++			foldedMatch = i;
+ 		}
+ 	}
++	if ( foldedMatch != -1 ) {
++		resolvedSegment = cache->entries[foldedMatch];
++		return true;
++	}
+ 
+ 	return false;
+ }
+@@ -2210,80 +2403,215 @@
+ idFileSystemLocal::ResolveCaseInsensitiveOSPath
+ ===================
+ */
+-bool idFileSystemLocal::ResolveCaseInsensitiveOSPath( const char *path, idStr &resolvedPath, bool finalSegmentIsFile ) {
+-	if ( !path ) {
+-		resolvedPath.Clear();
+-		return false;
++static void FS_NormalizeOSPathForResolve( idStr &path ) {
++	// '/' separators, no doubled separators, no trailing separator (but keep
++	// a lone "/")
++	idStr out;
++	const int len = path.Length();
++	for ( int i = 0; i < len; i++ ) {
++		char c = path[i];
++		if ( c == '\\' ) {
++			c = '/';
++		}
++		if ( c == '/' && out.Length() > 0 && out[ out.Length() - 1 ] == '/' ) {
++			continue;
++		}
++		out.Append( c );
+ 	}
+-
+-	if ( !path[0] ) {
+-		resolvedPath.Clear();
+-		return false;
++	while ( out.Length() > 1 && out[ out.Length() - 1 ] == '/' ) {
++		out.CapLength( out.Length() - 1 );
+ 	}
++	path = out;
++}
+ 
+-	idStr normalized = path;
+-	ReplaceSeparators( normalized, '/' );
++#ifndef WIN32
++static bool FS_ExactOSEntryMatches( const idStr &parentResolved, const idStr &segment, bool directoryOnly ) {
++	// Most mixed-case stock paths already use the exact on-disk spelling. A
++	// direct stat avoids enumerating the parent for them.
++	idStr exactPath = parentResolved;
++	exactPath.AppendPath( segment );
++	struct stat exactStat;
++	return stat( exactPath.c_str(), &exactStat ) == 0 &&
++		( directoryOnly ? S_ISDIR( exactStat.st_mode ) : !S_ISDIR( exactStat.st_mode ) );
++}
++#else
++static bool FS_ExactOSEntryMatches( const idStr &, const idStr &, bool ) {
++	// Windows has no S_ISDIR and does not need this optimization on its
++	// case-insensitive filesystem. Preserve the existing enumeration fallback
++	// if case recovery is explicitly enabled there.
++	return false;
++}
++#endif
+ 
+-	while ( normalized.Length() > 1 && normalized[ normalized.Length() - 1 ] == '/' ) {
+-		normalized.CapLength( normalized.Length() - 1 );
++/*
++===================
++idFileSystemLocal::ResolveCaseInsensitiveOSDirectory
++
++Memoized, parent first. See osResolvedDir_t.
++===================
++*/
++const idFileSystemLocal::osResolvedDir_t *idFileSystemLocal::ResolveCaseInsensitiveOSDirectory( const idStr &dir ) {
++	const int hash = osResolvedDirHash.GenerateKey( dir.c_str(), true );
++	for ( int i = osResolvedDirHash.First( hash ); i != -1; i = osResolvedDirHash.Next( i ) ) {
++		if ( osResolvedDirs[i]->key.Cmp( dir.c_str() ) == 0 ) {
++			return osResolvedDirs[i];
++		}
+ 	}
+ 
+-	const bool absolutePath = ( normalized[0] == '/' );
+-	const int pathLength = normalized.Length();
+-	int index = absolutePath ? 1 : 0;
+-	bool changed = false;
++	// A long session touches a bounded set of directories; bound it anyway.
++	if ( osResolvedDirs.Num() >= 16384 ) {
++		ClearResolvedOSDirectories();
++	}
+ 
+-	resolvedPath = absolutePath ? "/" : "";
++	osResolvedDir_t *entry = new osResolvedDir_t;
++	entry->key = dir;
++	entry->found = false;
++	entry->changed = false;
+ 
+-	while ( index < pathLength ) {
+-		while ( index < pathLength && normalized[index] == '/' ) {
+-			index++;
++	const int slash = dir.Last( '/' );
++	if ( dir.Length() == 0 || dir.Cmp( "/" ) == 0 ) {
++		// the root, or the current directory of a relative path
++		entry->resolved = dir;
++		entry->found = true;
++	} else {
++		idStr parentResolved;
++		bool parentFound = true;
++		bool parentChanged = false;
++		if ( slash > 0 ) {
++			const idStr parentKey = dir.Left( slash );
++			const osResolvedDir_t *parent = ResolveCaseInsensitiveOSDirectory( parentKey );
++			parentFound = parent->found;
++			parentChanged = parent->changed;
++			parentResolved = parent->resolved;
++		} else if ( slash == 0 ) {
++			parentResolved = "/";
+ 		}
+-		if ( index >= pathLength ) {
++		const idStr segment = dir.Right( dir.Length() - slash - 1 );
++		if ( parentFound ) {
++			idStr resolvedSegment;
++			if ( FS_ExactOSEntryMatches( parentResolved, segment, true ) ) {
++				resolvedSegment = segment;
++			} else if ( !FindCaseInsensitiveOSPathEntry( parentResolved.IsEmpty() ? "." : parentResolved.c_str(), segment.c_str(), true, resolvedSegment ) ) {
++				parentFound = false;
++				if ( fs_debug.GetBool() ) {
++					common->Printf( "idFileSystemLocal::ResolveCaseInsensitiveOSPath: could not resolve directory segment '%s' under '%s'\n",
++						segment.c_str(), parentResolved.IsEmpty() ? "." : parentResolved.c_str() );
++				}
++			}
++			if ( parentFound ) {
++				entry->found = true;
++				entry->changed = parentChanged || resolvedSegment.Cmp( segment.c_str() ) != 0;
++				entry->resolved = parentResolved;
++				entry->resolved.AppendPath( resolvedSegment );
++			}
++		}
++	}
++
++	// the recursion above may have appended entries; take the index afterwards
++	const int index = osResolvedDirs.Append( entry );
++	osResolvedDirHash.Add( hash, index );
++	return entry;
++}
++
++/*
++===================
++idFileSystemLocal::ForgetMissingOSDirectories
++
++A write or a CreateOSPath at osPath: every directory on its path may now exist.
++Drop only the NEGATIVE answers on that chain; positive ones stay true.
++===================
++*/
++void idFileSystemLocal::ForgetMissingOSDirectories( const char *osPath ) {
++	if ( osPath == NULL || osPath[0] == '\0' || osResolvedDirs.Num() == 0 ) {
++		return;
++	}
++	idStr dir = osPath;
++	FS_NormalizeOSPathForResolve( dir );
++	// osPath names a file (or, from CreateOSPath, a path whose last segment is
++	// a file); its directory and every ancestor are the candidates
++	while ( dir.Length() > 0 ) {
++		const int slash = dir.Last( '/' );
++		if ( slash < 0 ) {
+ 			break;
+ 		}
++		dir.CapLength( slash > 0 ? slash : 1 );
++		const int hash = osResolvedDirHash.GenerateKey( dir.c_str(), true );
++		for ( int i = osResolvedDirHash.First( hash ); i != -1; i = osResolvedDirHash.Next( i ) ) {
++			if ( osResolvedDirs[i]->key.Cmp( dir.c_str() ) != 0 ) {
++				continue;
++			}
++			if ( !osResolvedDirs[i]->found ) {
++				// Replace in place rather than remove: removal would shift
++				// indices and corrupt the hash (same as the listing cache).
++				osResolvedDirHash.Remove( hash, i );
++				osResolvedDirs[i]->key = "\n<forgotten>";
++			}
++			break;
++		}
++		if ( dir.Length() == 1 ) {
++			break;
++		}
++	}
++}
+ 
+-		const int segmentStart = index;
+-		while ( index < pathLength && normalized[index] != '/' ) {
+-			index++;
++void idFileSystemLocal::ClearResolvedOSDirectories( void ) {
++	osResolvedDirs.DeleteContents( true );
++	osResolvedDirHash.Free();
++}
++
++/*
++===================
++idFileSystemLocal::ResolveCaseInsensitiveOSPath
++
++Returns true only when the on-disk spelling differs from the one asked for.
++On failure resolvedPath is the input with native separators.
++===================
++*/
++bool idFileSystemLocal::ResolveCaseInsensitiveOSPath( const char *path, idStr &resolvedPath, bool finalSegmentIsFile ) {
++	if ( !path || !path[0] ) {
++		resolvedPath.Clear();
++		return false;
++	}
++
++	idStr normalized = path;
++	FS_NormalizeOSPathForResolve( normalized );
++
++	idStr directory;
++	idStr segment;
++	if ( finalSegmentIsFile ) {
++		const int slash = normalized.Last( '/' );
++		if ( slash < 0 ) {
++			segment = normalized;
++		} else {
++			directory = slash > 0 ? normalized.Left( slash ) : idStr( "/" );
++			segment = normalized.Right( normalized.Length() - slash - 1 );
+ 		}
++	} else {
++		directory = normalized;
++	}
+ 
+-		idStr segment = normalized.Mid( segmentStart, index - segmentStart );
+-		const bool hasMoreSegments = ( index < pathLength );
+-		const bool directoryOnly = hasMoreSegments || !finalSegmentIsFile;
+-		const char *parentDirectory = resolvedPath.IsEmpty() ? "." : resolvedPath.c_str();
+-		idStr resolvedSegment;
++	const osResolvedDir_t *dir = ResolveCaseInsensitiveOSDirectory( directory );
++	if ( !dir->found ) {
++		resolvedPath = normalized;
++		ReplaceSeparators( resolvedPath );
++		return false;
++	}
+ 
+-		// Most mixed-case stock paths already use the exact on-disk spelling.  A
+-		// direct stat avoids enumerating every parent directory for every loose-
+-		// file probe (including probes for assets that ultimately live in PK4s).
+-#ifndef WIN32
+-		idStr exactPath = resolvedPath;
+-		exactPath.AppendPath( segment );
+-		struct stat exactStat;
+-		const bool exactEntryMatches = stat( exactPath.c_str(), &exactStat ) == 0 &&
+-			( directoryOnly ? S_ISDIR( exactStat.st_mode ) : !S_ISDIR( exactStat.st_mode ) );
+-#else
+-		// Windows has no S_ISDIR and does not need this optimization on its
+-		// case-insensitive filesystem. Preserve the existing enumeration fallback
+-		// if case recovery is explicitly enabled there.
+-		const bool exactEntryMatches = false;
+-#endif
+-		if ( exactEntryMatches ) {
++	bool changed = dir->changed;
++	resolvedPath = dir->resolved;
++	if ( segment.Length() ) {
++		idStr resolvedSegment;
++		if ( FS_ExactOSEntryMatches( dir->resolved, segment, false ) ) {
+ 			resolvedSegment = segment;
+-		} else if ( !FindCaseInsensitiveOSPathEntry( parentDirectory, segment.c_str(), directoryOnly, resolvedSegment ) ) {
++		} else if ( !FindCaseInsensitiveOSPathEntry( dir->resolved.IsEmpty() ? "." : dir->resolved.c_str(), segment.c_str(), false, resolvedSegment ) ) {
+ 			if ( fs_debug.GetBool() ) {
+-				common->Printf( "idFileSystemLocal::ResolveCaseInsensitiveOSPath: could not resolve %s segment '%s' under '%s' while resolving '%s'\n",
+-					directoryOnly ? "directory" : "file",
+-					segment.c_str(),
+-					parentDirectory,
+-					path );
++				common->Printf( "idFileSystemLocal::ResolveCaseInsensitiveOSPath: could not resolve file segment '%s' under '%s' while resolving '%s'\n",
++					segment.c_str(), dir->resolved.IsEmpty() ? "." : dir->resolved.c_str(), path );
+ 			}
+ 			resolvedPath = normalized;
+ 			ReplaceSeparators( resolvedPath );
+ 			return false;
+ 		}
+-
+ 		if ( resolvedSegment.Cmp( segment.c_str() ) != 0 ) {
+ 			changed = true;
+ 		}
+@@ -5309,8 +5637,122 @@
+ 	}
+ 
+ 	return ( errors.Length() != 0 );
++}
++
++/*
++================
++OpenQ4 pak gate pass cache (Apple embedded platforms only, D-108)
++
++ValidateOpenQ4Paks hashes pak0 and pak1 in full on every launch: ~594 MB of
++MD5, 0.7-0.9 s on the simulator before the menu, every time. On iOS and
++visionOS both packs live inside the signed app bundle, which the OS does not
++let anything modify, so the answer can only change when the app is replaced.
++
++A PASS is therefore remembered under a key that changes whenever the app or a
++pak could have: the running executable's Mach-O LC_UUID (unique per link), and
++for each pak its path (the bundle path changes per install), expected MD5,
++size, mtime and inode. Any difference, a missing or unreadable cache, or a
++non-Apple platform falls through to the full hash, and a full-hash failure
++still fatals exactly as before. Only a pass is ever written, and a failing
++hash deletes the cache. The file lives in Library/Caches, which the OS may
++purge; that just costs one full hash.
++================
++*/
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#endif
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#define OPENQ4_PAK_GATE_CACHE 1
++
++static bool FS_PakGateExecutableUUID( idStr &out ) {
++	out.Clear();
++	const struct mach_header_64 *header = reinterpret_cast<const struct mach_header_64 *>( _dyld_get_image_header( 0 ) );
++	if ( header == NULL || header->magic != MH_MAGIC_64 ) {
++		return false;
++	}
++	const uint8_t *cursor = reinterpret_cast<const uint8_t *>( header + 1 );
++	for ( uint32_t i = 0; i < header->ncmds; i++ ) {
++		const struct load_command *cmd = reinterpret_cast<const struct load_command *>( cursor );
++		if ( cmd->cmd == LC_UUID ) {
++			const struct uuid_command *uuid = reinterpret_cast<const struct uuid_command *>( cmd );
++			for ( int b = 0; b < 16; b++ ) {
++				out += va( "%02x", uuid->uuid[ b ] );
++			}
++			return true;
++		}
++		cursor += cmd->cmdsize;
++	}
++	return false;
++}
++
++static bool FS_PakGateCachePath( idStr &out ) {
++	const char *home = getenv( "HOME" );
++	if ( home == NULL || home[ 0 ] == '\0' ) {
++		return false;
++	}
++	out = home;
++	out.AppendPath( "Library" );
++	out.AppendPath( "Caches" );
++	out.AppendPath( "openq4-pakgate.txt" );
++	return true;
++}
++
++static bool FS_PakGateAppendIdentity( idStr &key, const char *name, const char *expectedMD5, const char *path ) {
++	struct stat st;
++	if ( stat( path, &st ) != 0 ) {
++		return false;
++	}
++	key += va( "%s md5=%s size=%lld mtime=%lld.%09ld ino=%llu path=%s\n", name, expectedMD5,
++		(long long)st.st_size, (long long)st.st_mtimespec.tv_sec, (long)st.st_mtimespec.tv_nsec,
++		(unsigned long long)st.st_ino, path );
++	return true;
++}
++
++static bool FS_PakGateCacheMatches( const idStr &key ) {
++	idStr path;
++	if ( !FS_PakGateCachePath( path ) ) {
++		return false;
++	}
++	FILE *f = fopen( path.c_str(), "rb" );
++	if ( f == NULL ) {
++		return false;
++	}
++	char buffer[ 4096 ];
++	const size_t n = fread( buffer, 1, sizeof( buffer ) - 1, f );
++	fclose( f );
++	buffer[ n ] = '\0';
++	return (int)n == key.Length() && idStr::Cmp( buffer, key.c_str() ) == 0;
+ }
+ 
++static void FS_PakGateCacheStore( const idStr &key ) {
++	idStr path;
++	if ( !FS_PakGateCachePath( path ) ) {
++		return;
++	}
++	idStr dir = path;
++	dir.StripFilename();
++	mkdir( dir.c_str(), 0755 );
++	idStr temp = path + ".tmp";
++	FILE *f = fopen( temp.c_str(), "wb" );
++	if ( f == NULL ) {
++		return;
++	}
++	const bool ok = fwrite( key.c_str(), 1, key.Length(), f ) == (size_t)key.Length();
++	if ( fclose( f ) != 0 || !ok || rename( temp.c_str(), path.c_str() ) != 0 ) {
++		unlink( temp.c_str() );
++	}
++}
++
++static void FS_PakGateCacheForget( void ) {
++	idStr path;
++	if ( FS_PakGateCachePath( path ) ) {
++		unlink( path.c_str() );
++	}
++}
++#endif
++
+ /*
+ ================
+ idFileSystemLocal::ValidateOpenQ4Paks
+@@ -5331,8 +5773,27 @@
+ 
+ 	if ( idStr::Icmp( fs_game.GetString(), OPENQ4_GAMEDIR ) &&
+ 		 idStr::Icmp( fs_game_base.GetString(), OPENQ4_GAMEDIR ) ) {
++		return true;
++	}
++
++#ifdef OPENQ4_PAK_GATE_CACHE
++	// See "OpenQ4 pak gate pass cache" above.
++	idStr gateKey;
++	bool gateKeyValid = FS_PakGateExecutableUUID( gateKey );
++	if ( gateKeyValid ) {
++		gateKey = va( "openq4-pakgate v1 exe=%s\n", gateKey.c_str() );
++		for ( int i = 0; expectedPaks[ i ].name != NULL && gateKeyValid; i++ ) {
++			pack_t *pack = FindGamePackByName( expectedPaks[ i ].name, OPENQ4_GAMEDIR );
++			gateKeyValid = pack != NULL
++				&& FS_PakGateAppendIdentity( gateKey, expectedPaks[ i ].name, expectedPaks[ i ].md5, pack->pakFilename.c_str() );
++		}
++	}
++	if ( gateKeyValid && FS_PakGateCacheMatches( gateKey ) ) {
++		common->Printf( "%s pak checksums: pass cached for this build and these packs (not re-hashed)\n", OPENQ4_GAMEDIR );
+ 		return true;
+ 	}
++	const int gateHashStart = Sys_Milliseconds();
++#endif
+ 
+ 	for ( int i = 0; expectedPaks[ i ].name != NULL; i++ ) {
+ 		const expectedOpenQ4Pak_t &expected = expectedPaks[ i ];
+@@ -5355,6 +5816,16 @@
+ 		}
+ 	}
+ 
++#ifdef OPENQ4_PAK_GATE_CACHE
++	common->Printf( "%s pak checksums: full MD5 %s in %d ms\n", OPENQ4_GAMEDIR,
++		errors.Length() == 0 ? "passed" : "FAILED", Sys_Milliseconds() - gateHashStart );
++	if ( errors.Length() != 0 ) {
++		FS_PakGateCacheForget();
++	} else if ( gateKeyValid ) {
++		FS_PakGateCacheStore( gateKey );
++	}
++#endif
++
+ 	return ( errors.Length() == 0 );
+ }
+ 
+@@ -5499,6 +5970,10 @@
+ 	int				addon_index;
+ 
+ 	common->Printf( "------ Initializing File System ------\n" );
++
++	// directories may have been created outside the engine since the last
++	// startup (a Files drop, onboarding import); start the resolver clean
++	ClearResolvedOSDirectories();
+ 
+ 	if ( restartChecksums.Num() ) {
+ 		common->Printf( "restarting in pure mode with %d pak files\n", restartChecksums.Num() );
+--- a/src/framework/FileSystem.h
++++ b/src/framework/FileSystem.h
+@@ -324,6 +324,13 @@
+ 							// in some cases you may need to use this directly
+ 	virtual void			ClearDirCache( void ) = 0;
+ 
++							// Drop the cached directory listing that would answer for this OS
++							// path. Any code that creates, renames or removes a file behind the
++							// filesystem's back — the savegame commit does all three with raw
++							// POSIX calls — has to say so, or the case-insensitive resolver keeps
++							// answering from a listing taken before the change.
++	virtual void			InvalidateCachedOSPath( const char *osPath ) = 0;
++
+ 							// is D3XP installed? even if not running it atm
+ 	virtual bool			HasD3XP( void ) = 0;
+ 							// are we using D3XP content ( through a real d3xp run or through a double mod )

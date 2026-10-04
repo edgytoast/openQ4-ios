@@ -1,0 +1,93 @@
+--- a/src/sound/snd_world.cpp
++++ b/src/sound/snd_world.cpp
+@@ -29,6 +29,78 @@
+ */
+ #include "snd_local.h"
+ 
++/*
++ * openQ4-ios D-112: the rumble envelope.
++ *
++ * Every retail sound shader that `shakes` (183 of them, all of them) carries
++ * Raven's own per-sample envelope as `shakeData <choice> <letters>`: one letter
++ * per 1/30 s, 'a' = still, 'z' = hardest. That string IS how Quake 4 shaped its
++ * rumble and screen shake over a sound's length. Upstream's rumble sum ignored
++ * it and multiplied by idSoundVoice_OpenAL::GetAmplitude(), a stub that returns
++ * 1.0, so a shaking sound rumbled flat-out for its whole length (airdefense1's
++ * cannon intro: ~38 s without a break). Read the envelope at the channel's
++ * playback offset instead, with the same rate and the same letter -> amplitude
++ * curve idSoundEmitterLocal::CurrentAmplitude() already applies to it
++ * (snd_emitter.cpp SOUND_SHADER_SHAKE_*; duplicated because they are file
++ * statics there).
++ *
++ * A shaking shader WITHOUT shakeData (a mod's) keeps upstream's flat level but
++ * decays it over its first second, and a looping one is held at a low ceiling,
++ * so no sound can hold the motors at full strength indefinitely.
++ */
++static const int SOUND_RUMBLE_SHAKE_RATE_HZ = 30;
++static const float SOUND_RUMBLE_SHAKE_SCALE = 2800.0f;
++static const float SOUND_RUMBLE_SHAKE_NORMALIZE = 1.0f / 32768.0f;
++static const float SOUND_RUMBLE_NO_DATA_DECAY_MSEC = 1000.0f;
++static const float SOUND_RUMBLE_NO_DATA_LOOP_CEILING = 0.25f;
++
++static float SoundChannelShakeEnvelope( const idSoundChannel* chan, const int currentTime )
++{
++	// Read-only twin of snd_emitter.cpp's SoundChannelPlaybackTimeMsec (which
++	// advances the channel's frequency-shift clock as a side effect).
++	float relativeTime = 0.0f;
++	if( currentTime > chan->startTime )
++	{
++		if( chan->lastFrequencyShiftTime != 0 )
++		{
++			relativeTime = chan->elapsedFrequencyShiftTime + Max( 0, currentTime - chan->lastFrequencyShiftTime ) * chan->lastFrequencyShift;
++		}
++		else
++		{
++			relativeTime = ( float )( currentTime - chan->startTime );
++		}
++	}
++	const bool looping = ( chan->parms.soundShaderFlags & SSF_LOOPING ) != 0;
++
++	const char* shakeData = chan->soundShader != NULL ? chan->soundShader->GetShakeData( chan->choice ) : NULL;
++	if( shakeData == NULL || shakeData[0] == '\0' )
++	{
++		if( looping )
++		{
++			return SOUND_RUMBLE_NO_DATA_LOOP_CEILING;
++		}
++		return idMath::ClampFloat( 0.0f, 1.0f, 1.0f - relativeTime / SOUND_RUMBLE_NO_DATA_DECAY_MSEC );
++	}
++
++	const int length = idStr::Length( shakeData );
++	int index = idMath::FtoiFast( relativeTime * SOUND_RUMBLE_SHAKE_RATE_HZ / 1000.0f );
++	if( looping && length > 0 )
++	{
++		index %= length;
++	}
++	if( index < 0 || index >= length )
++	{
++		return 0.0f;
++	}
++	const int letter = Max( 0, shakeData[index] - 'a' );
++	if( letter == 0 )
++	{
++		return 0.0f;
++	}
++	const float curve = idMath::ATan( letter * SOUND_RUMBLE_SHAKE_SCALE * SOUND_RUMBLE_SHAKE_NORMALIZE, 1.0f ) / DEG2RAD( 45.0f );
++	return idMath::ClampFloat( 0.0f, 1.0f, curve );
++}
++
+ static const int SOUND_SAVEGAME_MAX_EMITTERS = 8192;
+ static const int SOUND_SAVEGAME_MAX_TOTAL_CHANNELS = 8192;
+ static const int SOUND_DEMO_MAX_CACHED_SOUNDS = 4096;
+@@ -821,7 +893,10 @@
+ 			continue;
+ 		}
+ 
+-		const float channelAmplitude = chan->hardwareVoice->GetGain() * chan->currentAmplitude;
++		// D-112: the shader's own envelope at this moment, not the voice stub's 1.0.
++		const float envelope = ( chan->parms.shakes != 0.0f || ( chan->parms.soundShaderFlags & SSF_CAUSE_RUMBLE ) != 0 )
++							   ? SoundChannelShakeEnvelope( chan, currentTime ) : 0.0f;
++		const float channelAmplitude = chan->hardwareVoice->GetGain() * chan->currentAmplitude * envelope;
+ 		shakeAmp += chan->parms.shakes * channelAmplitude;
+ 
+ 		float channelRumble = idMath::Fabs( chan->parms.shakes ) * channelAmplitude;

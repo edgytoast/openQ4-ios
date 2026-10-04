@@ -1,0 +1,21 @@
+# signing.local.sh — YOUR Apple signing identifiers, for the device lanes only.
+#
+# Copy this file to scripts/signing.local.sh and fill it in. That file is
+# sourced by scripts/signing.sh; it is personal infrastructure and is never part
+# of the public tree (scripts/make-public-tree.sh leaves it out, and
+# scripts/leak-scan.sh would flag its contents if it ever slipped in).
+#
+# Simulator builds need none of this — they are unsigned.
+#
+# Every value can also be supplied as an environment variable of the same name,
+# which wins over this file.
+
+# Your Apple Developer team ID (10 characters; Xcode > Settings > Accounts).
+OPENQ4_TEAM_ID="XXXXXXXXXX"
+
+# Optional: an App Store Connect API key, used by `xcodebuild -exportArchive`
+# to manage provisioning without an interactive Xcode login. Leave all three
+# empty to export with whatever account Xcode is signed in to.
+OPENQ4_ASC_KEY_ID=""
+OPENQ4_ASC_ISSUER_ID=""
+OPENQ4_ASC_KEY_PATH=""      # full path to the API key file you downloaded

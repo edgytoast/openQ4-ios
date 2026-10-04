@@ -1,0 +1,254 @@
+--- a/src/sys/osx/macosx_compat.mm
++++ b/src/sys/osx/macosx_compat.mm
+@@ -31,8 +31,37 @@
+ 
+ #include "../posix/posix_public.h"
+ 
++#import <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++// AppKit and CGL do not exist on iOS/visionOS. Everything else in this file is
++// portable POSIX path and thread plumbing; only Sys_GetVideoRam below is
++// genuinely macOS-bound, and it has a Metal implementation there.
++//
++// idlib's Math.h #undefs the C INFINITY macro (it provides idMath::INFINITY
++// instead), but Metal's headers use INFINITY. Restore it just across the import
++// and take it straight back out, so the rest of the TU sees exactly what idlib
++// intends.
++#ifndef INFINITY
++#define INFINITY __builtin_inff()
++#define OPENQ4_IOS_RESTORED_INFINITY 1
++#endif
++#import <UIKit/UIKit.h>
++#import <Metal/Metal.h>
++#import <os/proc.h>
++#ifdef OPENQ4_IOS_RESTORED_INFINITY
++#undef INFINITY
++#undef OPENQ4_IOS_RESTORED_INFINITY
++#endif
++#else
+ #import <AppKit/AppKit.h>
+ #import <OpenGL/OpenGL.h>
++#endif
++#if TARGET_OS_IPHONE
++// Implemented in the ObjC shell (ios/shell/openq4_ios_onboarding.m); declared at
++// file scope because extern "C" is not permitted inside a function body.
++extern "C" const char *OpenQ4_iOS_DocumentsPath( void );
++#endif
++
+ #import <mach-o/dyld.h>
+ #import <mach/mach_time.h>
+ #import <pthread.h>
+@@ -696,6 +725,22 @@
+ 	}
+ 	moduleRootPath[0] = '\0';
+ 
++#if TARGET_OS_IPHONE
++	// An iOS app bundle is flat: the executable sits at openQ4.app/openQ4 and
++	// embedded code lives in openQ4.app/Frameworks. That directory is the iOS
++	// peer of the macOS Contents/Frameworks trusted root below — game modules
++	// ship there, signed with the app, and are dlopen'd by the ordinary loader
++	// (DECISIONS D-014).
++	{
++		idStr bundleDirectory = Sys_EXEPath();
++		if ( bundleDirectory.Length() <= 0 ) {
++			return false;
++		}
++		bundleDirectory.StripFilename();
++		const idStr frameworks = bundleDirectory + "/Frameworks";
++		return Sys_CopyPathIfFits( moduleRootPath, moduleRootSize, frameworks.c_str() );
++	}
++#else
+ 	idStr exeDirectory = Sys_EXEPath();
+ 	if ( exeDirectory.Length() <= 0 ) {
+ 		return false;
+@@ -710,6 +755,7 @@
+ 	}
+ 
+ 	return Sys_CopyPathIfFits( moduleRootPath, moduleRootSize, moduleRoot.c_str() );
++#endif
+ }
+ 
+ /*
+@@ -748,6 +794,26 @@
+ ==============
+ */
+ const char *Sys_DefaultSavePath( void ) {
++#if TARGET_OS_IPHONE
++	// The app sandbox Documents directory, for two reasons.
++	//
++	// Correctness: the macOS path below resolves to $HOME/Library/Application
++	// Support, and on iOS $HOME is the container root, so writes there land
++	// outside anything the app may touch and fail with "Operation not
++	// permitted".
++	//
++	// Usability: Documents is what UIFileSharingEnabled +
++	// LSSupportsOpeningDocumentsInPlace expose in the Files app, so this is
++	// also where the user's retail q4base arrives and where their saves and
++	// configs are visible afterwards.
++	{
++		const char *docs = OpenQ4_iOS_DocumentsPath();
++		if ( docs != NULL && docs[0] != '\0' ) {
++			savepath = docs;
++			return savepath.c_str();
++		}
++	}
++#endif
+ 	idStr home;
+ 	if ( Sys_GetMacOSHomeDirectory( home ) ) {
+ 		idStr candidate = home;
+@@ -959,6 +1025,31 @@
+ ================
+ */
+ int Sys_GetVideoRam( void ) {
++#if TARGET_OS_IPHONE
++	// What constrains an iOS app is its Jetsam budget, NOT the GPU's addressable
++	// memory. On unified-memory hardware recommendedMaxWorkingSetSize reports
++	// the latter — 8192 MB on an A19 Pro — and feeding that to
++	// Common_DetectMachineSpec selects Ultra quality on a phone, which loads
++	// maximum-resolution textures until Jetsam kills the process. Jetsam uses
++	// SIGKILL, so it leaves no crash report and no catchable signal: the app
++	// simply vanishes. That is exactly what happened on the first device builds.
++	//
++	// os_proc_available_memory() is the honest number: bytes this process may
++	// still allocate before it is killed.
++	@autoreleasepool {
++		const uint64_t availBytes = (uint64_t)os_proc_available_memory();
++		if ( availBytes == 0 ) {
++			// Unavailable (older OS): assume a modest budget rather than an
++			// optimistic one — guessing high here is what kills the app.
++			return 512;
++		}
++		// Textures are only part of the footprint; the engine treats this figure
++		// as a texture budget, so hand it a fraction rather than the whole
++		// allowance.
++		const uint64_t budgetMB = ( availBytes / ( 1024ULL * 1024ULL ) ) / 3ULL;
++		return static_cast<int>( Min( budgetMB, static_cast<uint64_t>( idMath::INT_MAX ) ) );
++	}
++#else
+ 	CGLRendererInfoObj rendererInfo = NULL;
+ 	GLint rendererCount = 0;
+ 	unsigned long maxVRAM = 0;
+@@ -1006,6 +1097,7 @@
+ 
+ 	(void)CGLDestroyRendererInfo( rendererInfo );
+ 	return static_cast<int>( Min( maxVRAM, static_cast<unsigned long>( idMath::INT_MAX ) ) );
++#endif
+ }
+ 
+ /*
+--- a/src/sys/osx/macosx_misc.mm
++++ b/src/sys/osx/macosx_misc.mm
+@@ -27,8 +27,13 @@
+ */
+ 
+ #include "../../idlib/precompiled.h"
++#import <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#import <UIKit/UIKit.h>
++#else
+ #define GL_GLEXT_LEGACY // AppKit.h include pulls in gl.h already
+ #import <AppKit/AppKit.h>
++#endif
+ #import <Foundation/Foundation.h>
+ #import <crt_externs.h>
+ #import <errno.h>
+@@ -75,6 +80,12 @@
+ 	if ( window == NULL ) {
+ 		return false;
+ 	}
++#if TARGET_OS_IPHONE
++	// openQ4-ios: a UIKit window is borderless by construction (no title bar,
++	// no frame/content split), so there is nothing to measure; zero borders and
++	// "not known" is exactly what the caller's non-Cocoa path expects.
++	return false;
++#else
+ 
+ 	@autoreleasepool {
+ 		const SDL_PropertiesID properties = SDL_GetWindowProperties( window );
+@@ -101,6 +112,7 @@
+ 	}
+ 
+ 	return true;
++#endif
+ }
+ #endif
+ 
+@@ -347,10 +359,20 @@
+ 	}
+ 
+ 	common->Printf( "Open URL: %s\n", url );
++#if TARGET_OS_IPHONE
++	// NSWorkspace is AppKit-only. UIApplication's opener is asynchronous and
++	// must be called on the main thread, so success here means "handed to the
++	// system", not "opened" — the engine's return value cannot mean more than
++	// that on iOS.
++	dispatch_async( dispatch_get_main_queue(), ^{
++		[[UIApplication sharedApplication] openURL:nsURL options:@{} completionHandler:nil];
++	} );
++#else
+ 	if ( ![[ NSWorkspace sharedWorkspace ] openURL: nsURL ] ) {
+ 		common->Printf( "OpenURL failed after validation\n" );
+ 		return;
+ 	}
++#endif
+ 
+ 	if ( doexit ) {
+ 		quit_spamguard = true;
+--- a/src/sys/osx/macosx_sdl3.cpp
++++ b/src/sys/osx/macosx_sdl3.cpp
+@@ -12,7 +12,10 @@
+ #include "../../idlib/precompiled.h"
+ #include "../../renderer/tr_local.h"
+ 
++#include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE
+ #include <ApplicationServices/ApplicationServices.h>
++#endif
+ 
+ #define OPENQ4_SDL3_DARWIN_HOST 1
+ #include "../sdl3/sdl3_backend.cpp"
+@@ -29,6 +32,10 @@
+ 	return SDL3_QueryDesktopResolution(width, height, "SDL3 macOS");
+ }
+ 
++#if !TARGET_OS_IPHONE
++// CoreGraphics display enumeration is macOS-only. iOS has a single display and
++// the SDL3 backend already resolves it, so nothing on iOS calls this — the one
++// in-build caller, Sys_GetVideoRam in macosx_compat.mm, uses Metal there.
+ CGDirectDisplayID Sys_DisplayToUse(void) {
+ 	CGDirectDisplayID displays[32];
+ 	CGDisplayCount displayCount = 0;
+@@ -50,3 +57,4 @@
+ 	}
+ 	return 0;
+ }
++#endif
+--- a/src/sys/osx/macosx_sys.h
++++ b/src/sys/osx/macosx_sys.h
+@@ -1,9 +1,16 @@
+ #import "../posix/posix_public.h"
+ 
++#import <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++// Foundation/NSGeometry.h and ApplicationServices are macOS-only. CoreGraphics
++// supplies the geometry types (CGRect) this header needs on iOS/visionOS.
++#import <CoreGraphics/CoreGraphics.h>
++#else
+ #import <Foundation/NSGeometry.h>
+ @class NSEvent;
+ 
+ #import <ApplicationServices/ApplicationServices.h>
++#endif
+ 
+ // Native GL context state for the legacy native backend lives in
+ // macosx_native_gl.h so the SDL3 release path never sees those tokens
+@@ -16,7 +23,9 @@
+ // In macosx_input.m
+ void Sys_InitInput(void);
+ void Sys_ShutdownInput(void);
++#if !TARGET_OS_IPHONE
+ CGDirectDisplayID Sys_DisplayToUse(void);
++#endif
+ //extern void osxQuit();
+ void SetProgramPath(char *path);
+ void Sys_SetMouseInputRect(CGRect newRect);

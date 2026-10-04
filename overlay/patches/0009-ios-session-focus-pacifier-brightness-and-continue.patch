@@ -1,0 +1,848 @@
+--- a/src/framework/Session.cpp
++++ b/src/framework/Session.cpp
+@@ -29,6 +29,9 @@
+ 
+ 
+ 
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#endif
+ #include "Session_local.h"
+ #include "ArenaCampaign.h"
+ #include "BuildVersion.h"
+@@ -71,6 +74,153 @@
+ idCVar	com_showLevelLoadTimes( "com_showLevelLoadTimes", "1", CVAR_SYSTEM | CVAR_BOOL, "print detailed phase timings for level loads" );
+ idCVar	com_skipLogoVideos( "com_skipLogoVideos", "1", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "skip startup logo videos and go straight to the main menu" );
+ idCVar	com_showLevelshotBounds( "com_showLevelshotBounds", "0", CVAR_SYSTEM | CVAR_ARCHIVE | CVAR_BOOL, "draw a centered 4:3 frame guide for levelshot composition" );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++// Declared locally: the engine should not include the app shell's headers.
++extern "C" void OpenQ4_iOS_NoteMainAlive( void );
++extern "C" void OpenQ4_iOS_ServiceRunLoopDuringInit( void );
++extern "C" void OpenQ4_iOS_SetActivity( const char *what );
++extern "C" void OpenQ4_iOS_LoadProgress( void );
++
++/*
++ * Whole-frame brightness, drawn as one blended quad after everything else.
++ *
++ * The obvious cvars are both dead ends on this substrate and it cost two rounds
++ * to establish that. r_gamma/r_brightness build gamma tables every frame and
++ * hand them to GLimp_SetGamma, which the Vulkan backend implements as an empty
++ * function; the GLSL fallback that covers that case (RB_ApplyColorMappingsToBackBuffer)
++ * lives in draw_common.cpp and only ever runs under the GL backend. r_lightScale
++ * does work, but it scales scene LIGHTING — so it leaves menus, the HUD, fog and
++ * anything unlit exactly where they were, and its default is 2, which meant the
++ * shell pushing 1.0 as "normal" had been running the whole game at half light.
++ *
++ * A post pass that samples the finished frame would be the textbook fix, and it
++ * needs a swapchain copy plus a new SPIR-V shader — real bandwidth, every frame,
++ * on the device we are trying to get to 120 Hz. The same curve is approximated
++ * here with blended fullscreen quads and no new shaders:
++ *
++ *   gain (b > 1)  blend GL_DST_COLOR, GL_ONE            ->  dst * (1 + a)
++ *   lift (b > 1)  blend GL_ONE_MINUS_DST_COLOR, GL_ONE  ->  dst + (1 - dst) * k
++ *   darken (b<1)  blend GL_DST_COLOR, GL_ZERO           ->  dst * b
++ *
++ * Gain does most of the work and lift only a little, and the split is the whole
++ * point. Lift alone was tried first and measured a clean monotonic response —
++ * and looked wrong, because a screen blend raises ABSOLUTE BLACK by k: at the
++ * top of the slider the letterbox bars turned grey. Gamma does not do that,
++ * pow(0, x) is still 0. Gain keeps black at black and opens the midtones, and
++ * the small lift on top is what makes an unlit corner readable rather than just
++ * a brighter shade of unreadable.
++ */
++idCVar r_iosBrightness( "r_iosBrightness", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
++		"whole-frame brightness: 1 = untouched, above 1 brightens, below 1 darkens", 0.5f, 2.0f );
++
++#if defined( OPENQ4_VISIONOS_3D )
++/*
++ * visionOS stereo 3D (openQ4-ios D-101). Defined in renderer/tr_main.cpp, which
++ * is inside the renderer MODULE — a layering reach that is legal here and only
++ * here: OPENQ4_VISIONOS_3D is defined on the visionOS lanes alone, and on those
++ * lanes the renderer is statically linked into the same archive as the framework
++ * (scripts/build-ios-engine.sh, OPENQ4_RENDERER_MODULE_STATIC). Declared rather
++ * than included because tr_local.h is not on the framework's include path and
++ * putting it there would drag the whole renderer into the framework's TUs.
++ */
++extern bool R_Stereo_Enabled( void );
++extern void R_Stereo_SetEye( int eye );
++#endif
++
++typedef enum {
++	SESSION_IOS_BRIGHT_GAIN,
++	SESSION_IOS_BRIGHT_LIFT,
++	SESSION_IOS_BRIGHT_DARKEN
++} sessionIOSBrightnessPass_t;
++
++static const idMaterial *Session_iOSBrightnessMaterial( sessionIOSBrightnessPass_t pass ) {
++	const char *name = NULL;
++	const char *blend = NULL;
++	switch ( pass ) {
++		case SESSION_IOS_BRIGHT_GAIN:
++			name = "openq4/ios/screenGain";
++			blend = "\t\tblend GL_DST_COLOR, GL_ONE\n";
++			break;
++		case SESSION_IOS_BRIGHT_LIFT:
++			name = "openq4/ios/screenLift";
++			blend = "\t\tblend GL_ONE_MINUS_DST_COLOR, GL_ONE\n";
++			break;
++		default:
++			name = "openq4/ios/screenDarken";
++			blend = "\t\tblend GL_DST_COLOR, GL_ZERO\n";
++			break;
++	}
++
++	const idMaterial *existing = declManager->FindMaterial( name, false );
++	if ( existing != NULL ) {
++		return existing;
++	}
++
++	idStr source;
++	source += va( "%s\n", name );
++	source += "{\n";
++	source += "\tnoShadows\n";
++	source += "\t{\n";
++	// GL_-prefixed names: idMaterial::NameToSrcBlendMode matches the GL token
++	// spellings and nothing else, and an unknown one warns, defaults the
++	// material and silently blends GL_ONE, GL_ZERO — an opaque sheet. The first
++	// version of this used the short 'one_minus_dst_color' spelling the .mtr
++	// files appear to use and drew nothing at all.
++	source += blend;
++	// 'colored' is what makes SetColor4 reach the stage; without it the vertex
++	// colour the GUI model emits is ignored and the quad is drawn at full
++	// strength, which is a white-out rather than a brightness control.
++	source += "\t\tcolored\n";
++	source += "\t\tnopicmip\n";
++	source += "\t\tmap _white\n";
++	source += "\t}\n";
++	source += "}\n";
++
++	idMaterial *material = static_cast<idMaterial *>(
++			declManager->CreateNewDecl( DECL_MATERIAL, name, "openq4_ios_brightness.mtr" ) );
++	if ( material == NULL ) {
++		return NULL;
++	}
++	material->SetText( source.c_str() );
++	material->Parse( source.c_str(), source.Length() );
++	material->SetSort( SS_GUI );
++	return material;
++}
++
++static void Session_iOSDrawBrightnessQuad( sessionIOSBrightnessPass_t pass, float k ) {
++	const idMaterial *material = Session_iOSBrightnessMaterial( pass );
++	if ( material == NULL ) {
++		return;
++	}
++	const float screenW = static_cast<float>( renderSystem->GetScreenWidth() );
++	const float screenH = static_cast<float>( renderSystem->GetScreenHeight() );
++	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
++	renderSystem->SetUseUIViewportFor2D( false );
++	renderSystem->SetColor4( k, k, k, 1.0f );
++	renderSystem->DrawStretchPic( 0.0f, 0.0f, screenW, screenH, 0.0f, 0.0f, 1.0f, 1.0f, material );
++	renderSystem->SetColor( colorWhite );
++	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
++}
++
++static void Session_iOSApplyBrightness( void ) {
++	const float brightness = idMath::ClampFloat( 0.5f, 2.0f, r_iosBrightness.GetFloat() );
++	if ( idMath::Fabs( brightness - 1.0f ) <= 0.001f ) {
++		return;			// neutral costs nothing at all, which is the common case
++	}
++
++	if ( brightness < 1.0f ) {
++		Session_iOSDrawBrightnessQuad( SESSION_IOS_BRIGHT_DARKEN, brightness );
++		return;
++	}
++
++	// At the top of the slider: everything x1.8, then black lifted to 0.10. The
++	// lift is deliberately small — see the note above about grey letterbox bars.
++	const float excess = brightness - 1.0f;
++	Session_iOSDrawBrightnessQuad( SESSION_IOS_BRIGHT_GAIN, excess * 0.8f );
++	Session_iOSDrawBrightnessQuad( SESSION_IOS_BRIGHT_LIFT, excess * 0.10f );
++}
++#endif
++
+ idCVar	s_muteUnfocused( "s_muteUnfocused", "1", CVAR_ARCHIVE | CVAR_BOOL, "mute all audio when the application is out of focus" );
+ 
+ #if defined( USE_SDL3 )
+@@ -1082,12 +1232,23 @@
+ static void Session_RemoveRelativeSaveFile( const idStr &relativePath ) {
+ 	idStr osPath = fileSystem->RelativePathToOSPath( relativePath.c_str(), "fs_savepath" );
+ 	fileSystem->RemoveExplicitFile( osPath.c_str() );
++	// RemoveExplicitFile drops the legacy dir_cache but not the case-insensitive
++	// OS listing cache, which the save commit has usually just populated in its
++	// pre-commit state.
++	fileSystem->InvalidateCachedOSPath( osPath.c_str() );
+ }
+ 
+ static bool Session_RenameRelativeSaveFile( const idStr &from, const idStr &to ) {
+ 	idStr fromOSPath = fileSystem->RelativePathToOSPath( from.c_str(), "fs_savepath" );
+ 	idStr toOSPath = fileSystem->RelativePathToOSPath( to.c_str(), "fs_savepath" );
+-	return rename( fromOSPath.c_str(), toOSPath.c_str() ) == 0;
++	const bool renamed = rename( fromOSPath.c_str(), toOSPath.c_str() ) == 0;
++	// A raw rename() is invisible to the filesystem layer, so both directories
++	// keep serving a listing taken before the save existed. Checking whether the
++	// destination exists — which the commit does immediately before this — is
++	// what populates that stale entry in the first place.
++	fileSystem->InvalidateCachedOSPath( fromOSPath.c_str() );
++	fileSystem->InvalidateCachedOSPath( toOSPath.c_str() );
++	return renamed;
+ }
+ 
+ static bool Session_AppendSaveGameIntegrityTrailer( const idStr &relativePath ) {
+@@ -2693,7 +2854,22 @@
+ }
+ 
+ static bool Session_ShouldSilenceAudioWhenUnfocused() {
+-#if defined( USE_SDL3 )
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Never on iOS, and not merely as a default.
++	//
++	// Sys_SDL_IsGameWindowFocused requires SDL_WINDOW_INPUT_FOCUS, which is a
++	// desktop keyboard-focus concept that uikit has no reason to set. When it
++	// reads false, SetPlayingSoundWorld swaps the world for NULL and the app
++	// goes COMPLETELY silent while every subsystem reports healthy — the AL
++	// device is open, the decls load, the emitters exist, there is simply no
++	// world to mix. That is exactly the symptom that had the menu silent.
++	//
++	// A cvar default would not be enough: s_muteUnfocused is CVAR_ARCHIVE and
++	// the platform profile is exec'd BEFORE the saved config, so any install
++	// that ever wrote 1 would keep it. Backgrounding on iOS is handled by the
++	// audio session and interruption notifications, which is the right layer.
++	return false;
++#elif defined( USE_SDL3 )
+ 	return s_muteUnfocused.GetBool() && !Sys_SDL_IsGameWindowFocused();
+ #elif defined( _WIN32 )
+ 	return s_muteUnfocused.GetBool() && !Sys_IsGameWindowFocused();
+@@ -4971,6 +5147,11 @@
+ idSessionLocal::StartNewGame
+ ===============
+ */
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++// D-114: restartLevelFromSave's inventory, set only around its one StartNewGame call.
++static const idDict *session_iosStartPlayerInfo;
++#endif
++
+ void idSessionLocal::StartNewGame( const char *mapName, bool devmap, const char *entityFilter ) {
+ #ifdef	ID_DEDICATED
+ 	common->Printf( "Dedicated servers cannot start singleplayer games.\n" );
+@@ -5010,6 +5191,11 @@
+ 	// clear the userInfo so the player starts out with the defaults
+ 	mapSpawnData.userInfo[0].Clear();
+ 	mapSpawnData.persistentPlayerInfo[0].Clear();
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	if ( session_iosStartPlayerInfo != NULL ) {
++		mapSpawnData.persistentPlayerInfo[0] = *session_iosStartPlayerInfo;
++	}
++#endif
+ 	mapSpawnData.userInfo[0] = *cvarSystem->MoveCVarsToDict( CVAR_USERINFO );
+ 
+ 	mapSpawnData.serverInfo.Clear();
+@@ -6201,13 +6387,476 @@
+ 	return ( Session_CommandSaveGameType( args ) == ST_REGULAR ) ? args.Argv(1) : NULL;
+ }
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++void Session_iOS_ExplainLoadRefusal( const char *slotName );
++#endif
++
+ void LoadGame_f( const idCmdArgs &args ) {
+ 	console->Close();
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// D-114: a refused load used to leave the player where he was with nothing
++	// but a console line. This is also the path a menu load takes after the
++	// game-module swap (Arena -> Load Game), where it dropped him at the menu.
++	// Only the save-file reasons are explained (the guards are in
++	// Session_iOS_ExplainLoadRefusal): net play and a slot with no file keep
++	// LoadGame's own console line. The slot is resolved exactly as LoadGame
++	// resolves it, so a quickload checks the quicksave it actually tried.
++	const char *slot = Session_CommandLoadGameName( args );
++	if ( !sessLocal.LoadGame( slot ) ) {
++		idStr requested = ( slot != NULL && slot[0] != '\0' ) ? slot : idSessionLocal::com_lastQuicksave.GetString();
++		if ( requested.IsEmpty() ) {
++			requested = "Quicksave0";
++		}
++		Session_iOS_ExplainLoadRefusal( requested.c_str() );
++	}
++#else
+ 	sessLocal.LoadGame( Session_CommandLoadGameName( args ) );
++#endif
+ }
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
+ /*
+ ===============
++Session_LoadNewestGame_f
++
++openQ4-ios: the openq4://continue route and the Continue App Intent. Tries the
++savegames newest first — the same list, filter and order the Load menu uses —
++and stops at the first one LoadGame accepts. LoadGame refuses an unloadable
++save (older payload, other wire ABI, missing map, truncated file) before it
++tears down anything, so moving on to the next one is safe. No slot name ever
++passes through a console line.
++===============
++*/
++static void Session_LoadNewestGame_f( const idCmdArgs &args ) {
++	if ( sessLocal.IsMultiplayer() ) {
++		common->Printf( "loadNewestGame: can't load during net play.\n" );
++		return;
++	}
++	// Same module switch LoadGame does, but re-running THIS command after the
++	// reload so the fallback survives it.
++	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
++	if ( idStr::Icmp( activeModule, "game_sp" ) != 0 ) {
++		cvarSystem->SetCVarString( "si_gameType", "singleplayer" );
++		cvarSystem->SetCVarString( "com_nextGameModule", "game_sp" );
++		idCmdArgs reloadArgs;
++		reloadArgs.AppendArg( "loadNewestGame" );
++		cmdSystem->SetupReloadGameModule( reloadArgs );
++		return;
++	}
++
++	idStrList fileList;
++	idList<fileTIME_T> fileTimes;
++	sessLocal.GetSaveGameList( fileList, fileTimes );
++	for ( int i = 0; i < fileTimes.Num(); i++ ) {
++		const idStr &slot = fileList[ fileTimes[i].index ];
++		common->Printf( "loadNewestGame: trying '%s' (%d of %d)\n", slot.c_str(), i + 1, fileTimes.Num() );
++		console->Close();
++		if ( sessLocal.LoadGame( slot.c_str() ) ) {
++			return;
++		}
++	}
++	common->Printf( "loadNewestGame: no loadable savegame (%d listed) - staying put\n", fileTimes.Num() );
++}
++
++/*
++===============
++Session_iOS_ProbeSaveGame
++
++openQ4-ios (D-114). Answers "can this build load that save, and if not, why"
++WITHOUT loading it, logging over it or needing the game module: the Load Game
++list marks old saves with it, and the menu asks it before a load so a save
++that will be refused never costs a game-module swap first (Arena -> Load Game
++used to reload the whole engine only to be refused and dropped at the menu).
++
++It reads exactly what LoadGame's preflight reads — the header, the persistent
++player info, the payload stamp — and applies the same gates in the same order
++(Session_ValidateSaveGamePayload), minus the integrity checksum: a save that
++passes here and fails the checksum is still refused by LoadGame and then
++reported as damaged. Verdicts:
++  0 loadable, 1 made by an older openQ4 (v2 payload, below the build floor, or
++  no openQ4 stamp at all), 2 made for another platform/ABI, 3 its map is not
++  installed, 4 unreadable/damaged.
++The map, entity filter and player 0's persistent info (inventory at save time)
++are returned for the restart rescue below; they sit in the header BEFORE the
++payload, in a format (strings and a key/value dict) that did not change with
++the payload version.
++===============
++*/
++int Session_iOS_ProbeSaveGame( const char *slotName, idStr *mapOut, idStr *entityFilterOut, idDict *playerInfoOut ) {
++	if ( mapOut != NULL ) { mapOut->Clear(); }
++	if ( entityFilterOut != NULL ) { entityFilterOut->Clear(); }
++	if ( playerInfoOut != NULL ) { playerInfoOut->Clear(); }
++
++	idStr slot = ( slotName != NULL ) ? slotName : "";
++	sessLocal.ScrubSaveGameFileName( slot );
++	if ( slot.IsEmpty() ) {
++		return 4;
++	}
++	slot.SetFileExtension( ".save" );
++	idStr path = "savegames/";
++	path += slot;
++
++	idStr game = cvarSystem->GetCVarString( "fs_game" );
++	idFile *file = fileSystem->OpenFileRead( path, true, game.Length() ? game.c_str() : NULL );
++	if ( file == NULL ) {
++		return 4;
++	}
++	int fileLength = -1;
++	if ( !Session_GetBoundedSaveGameLength( file, path, "load probe", fileLength ) ) {
++		fileSystem->CloseFile( file );
++		return 4;
++	}
++
++	idStr gamename, saveMap, entityFilter;
++	int version = 0;
++	idDict playerInfo;
++	bool valid = Session_ReadSaveGameString( file, gamename, MAX_STRING_CHARS, "game name", path.c_str() )
++		&& Session_IsSupportedSaveGameName( gamename )
++		&& Session_ReadSaveGameInt( file, version, "version", path.c_str() );
++	if ( valid && !Session_IsCompatibleSaveGameVersion( version ) ) {
++		fileSystem->CloseFile( file );
++		return 1;
++	}
++	valid = valid && Session_ReadSaveGameString( file, saveMap, MAX_STRING_CHARS, "map name", path.c_str() );
++	if ( valid && Session_SaveGameHeaderUsesEntityFilter( gamename ) ) {
++		valid = Session_ReadSaveGameString( file, entityFilter, MAX_STRING_CHARS, "entity filter", path.c_str() );
++	}
++	for ( int i = 0; valid && i < MAX_ASYNC_CLIENTS; i++ ) {
++		idDict info;
++		valid = Session_ReadSaveGameDict( file, info, va( "persistent player info %d", i ), path.c_str() );
++		if ( valid && i == 0 ) {
++			playerInfo = info;
++		}
++	}
++	if ( !valid || saveMap.IsEmpty() ) {
++		fileSystem->CloseFile( file );
++		return 4;
++	}
++
++	idStr normalizedMap, normalizedFilter;
++	Session_NormalizeMapPathAndEntityFilter( saveMap.c_str(), entityFilter.c_str(), normalizedMap, normalizedFilter );
++	if ( !Session_IsSafeNormalizedMapPath( normalizedMap ) ) {
++		fileSystem->CloseFile( file );
++		return 4;
++	}
++	if ( mapOut != NULL ) { *mapOut = normalizedMap; }
++	if ( entityFilterOut != NULL ) { *entityFilterOut = normalizedFilter; }
++	if ( playerInfoOut != NULL ) { *playerInfoOut = playerInfo; }
++
++	// The payload stamp, as Session_ValidateSaveGamePayload reads it.
++	int verdict = 0;
++	int marker = 0, payloadVersion = 0, payloadBuild = 0, payloadFileCount = 0;
++	idStr payloadStamp, payloadABI;
++	if ( !Session_ReadSaveGameInt( file, marker, "payload marker", path.c_str() ) ) {
++		verdict = 4;
++	} else if ( marker != SESSION_OPENQ4_SAVEGAME_COMPATIBILITY_MAGIC ) {
++		// Retail or pre-stamp openQ4 payload. LoadGame's legacy branch accepts
++		// one only from the Windows MSVC ABI, which no Apple build is.
++		verdict = 1;
++	} else if ( !Session_ReadSaveGameInt( file, payloadVersion, "payload version", path.c_str() )
++			|| !Session_ReadSaveGameInt( file, payloadBuild, "payload build", path.c_str() )
++			|| !Session_ReadSaveGameString( file, payloadStamp, SESSION_OPENQ4_SAVEGAME_SOURCE_STAMP_MAX_BYTES, "payload source stamp", path.c_str() )
++			|| !Session_ReadSaveGameInt( file, payloadFileCount, "payload source file count", path.c_str() ) ) {
++		verdict = 4;
++	} else if ( payloadVersion < SESSION_OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
++		verdict = 1;
++	} else if ( payloadVersion != SESSION_OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
++		verdict = 4;
++	} else if ( !Session_ReadSaveGameString( file, payloadABI, SESSION_OPENQ4_SAVEGAME_ABI_STAMP_MAX_BYTES, "payload wire ABI", path.c_str() ) ) {
++		verdict = 4;
++	} else if ( payloadABI.Icmp( Session_GetSaveGameWireABI() ) != 0 ) {
++		verdict = 2;
++	} else if ( payloadBuild < SESSION_OPENQ4_SAVEGAME_MINIMUM_SUPPORTED_BUILD ) {
++		verdict = 1;
++	} else if ( !Session_SaveGameMapExists( normalizedMap, normalizedFilter ) ) {
++		verdict = 3;
++	}
++	fileSystem->CloseFile( file );
++	return verdict;
++}
++
++/*
++===============
++Session_iOS_ExplainLoadRefusal / restartLevelFromSave
++
++D-114. Tell the player, in the UI and in his language, why a save did not load
++(the strings live with the shell's other localised text: OpenQ4_iOS_SaveText,
++openq4_ios_loc.m). For a save from an older openQ4 — every save made before the
++v0.13.2 pin bump, whose payload upstream no longer decodes — offer the one
++rescue the header still allows: start that save's level again from its
++beginning, carrying the inventory recorded in the save (the same persistent
++player info a level transition carries), which also writes a fresh autosave in
++the current format.
++===============
++*/
++extern "C" const char *OpenQ4_iOS_SaveText( int which );
++static idStr session_iosRescueSlot;
++
++static idStr Session_iOS_MapTitle( const idStr &normalizedMap ) {
++	idDict mapDecl;
++	if ( Session_GetMapDeclDictForNormalizedPath( normalizedMap, mapDecl ) ) {
++		const char *name = mapDecl.GetString( "name", "" );
++		if ( name[0] != '\0' ) {
++			idStr title = common->GetLanguageDict()->GetString( name );
++			title.RemoveColors();
++			if ( title.Length() > 0 ) {
++				return title;
++			}
++		}
++	}
++	idStr title = normalizedMap;
++	title.StripPath();
++	title.StripFileExtension();
++	return title;
++}
++
++// The save's own file (fs_game first, as LoadGame opens it). Empty / unsafe
++// names have no file.
++static bool Session_iOS_SaveFileExists( const char *slotName ) {
++	idStr slot = ( slotName != NULL ) ? slotName : "";
++	sessLocal.ScrubSaveGameFileName( slot );
++	if ( slot.IsEmpty() ) {
++		return false;
++	}
++	slot.SetFileExtension( ".save" );
++	idStr game = cvarSystem->GetCVarString( "fs_game" );
++	idFile *file = fileSystem->OpenFileRead( va( "savegames/%s", slot.c_str() ), true, game.Length() ? game.c_str() : NULL );
++	if ( file == NULL ) {
++		return false;
++	}
++	fileSystem->CloseFile( file );
++	return true;
++}
++
++// The box's buttons fire their commands at the GUI it returns to
++// (HandleMsgCommands -> DispatchCommand(guiMsgRestore, ...)), and only the main
++// menu runs "exec restartLevelFromSave". With no GUI under the box (a refusal
++// after a game-module swap, or one raised in play: F9 "loadgame quick", a
++// console loadGame) YES was dispatched to nothing and the player was dropped
++// back into the running level with nothing restarted (round 70). So the box
++// always opens over the main menu, the in-game one if a level is running.
++static void Session_iOS_MenuUnderSaveBox( void ) {
++	if ( sessLocal.guiActive != sessLocal.guiMainMenu ) {
++		sessLocal.StartMenu();
++	}
++}
++
++void Session_iOS_ExplainLoadRefusal( const char *slotName ) {
++	// Not every refusal is about the save. LoadGame also says no during net
++	// play and for a slot with no file (a quickload before any quicksave);
++	// neither is "damaged", so neither gets the box — LoadGame already printed
++	// the accurate console line.
++	if ( sessLocal.IsMultiplayer() ) {
++		common->Printf( "loadGame: refused during net play - not a save problem, no dialog\n" );
++		return;
++	}
++	if ( !Session_iOS_SaveFileExists( slotName ) ) {
++		common->Printf( "loadGame: no save file for '%s' - nothing to explain, no dialog\n", slotName ? slotName : "" );
++		return;
++	}
++
++	idStr map, filter;
++	int verdict = Session_iOS_ProbeSaveGame( slotName, &map, &filter, NULL );
++	if ( verdict == 0 ) {
++		// The probe passed but LoadGame did not (checksum, interrupted files):
++		// damaged is the honest name for every such reason.
++		verdict = 4;
++	}
++	common->Printf( "loadGame: '%s' was refused (reason %d) - telling the player\n", slotName ? slotName : "", verdict );
++
++	Session_iOS_MenuUnderSaveBox();
++
++	const char *title = OpenQ4_iOS_SaveText( 1 );
++	if ( verdict == 1 && map.Length() > 0 ) {
++		session_iosRescueSlot = slotName;
++		const idStr mapTitle = Session_iOS_MapTitle( map );
++		idStr body = va( OpenQ4_iOS_SaveText( 2 ), mapTitle.c_str() );
++		sessLocal.MessageBox( MSG_YESNO, body.c_str(), title, false, "exec restartLevelFromSave", "" );
++		return;
++	}
++	session_iosRescueSlot.Clear();
++	const int which = ( verdict == 1 ) ? 6 : ( verdict == 2 ) ? 3 : ( verdict == 3 ) ? 4 : 5;
++	sessLocal.MessageBox( MSG_OK, OpenQ4_iOS_SaveText( which ), title, false );
++}
++
++/*
++Session_iOS_KeepAutosaveCopy — the restart below ends in StartNewGame's level-
++start autosave, which goes to the level's one autosave slot ("Autosave <map>
++[<filter>]", Session_GenerateSaveFileName) and replaces whatever is there: the
++old save being rescued if it IS that autosave, or a newer good autosave of the
++same level. The dialog says so, and this keeps the slot's current contents
++first, as "<autosave> (before restart)" — a new slot (never an existing one;
++2..9 are tried), whose description names it in the player's language so it
++reads as a distinct row in Load Game ("Before restart"). Returns false only when an autosave
++exists and could not be copied; the caller then does not restart.
++*/
++static bool Session_iOS_ReadSaveSlotFile( const idStr &path, idList<byte> &bytes ) {
++	idStr game = cvarSystem->GetCVarString( "fs_game" );
++	idFile *file = fileSystem->OpenFileRead( path.c_str(), true, game.Length() ? game.c_str() : NULL );
++	if ( file == NULL ) {
++		return false;
++	}
++	const int len = file->Length();
++	bool ok = len >= 0;
++	if ( ok ) {
++		bytes.SetNum( len );
++		ok = len == 0 || file->Read( bytes.Ptr(), len ) == len;
++	}
++	fileSystem->CloseFile( file );
++	return ok;
++}
++
++static bool Session_iOS_WriteSaveSlotFile( const idStr &path, const void *data, int len ) {
++	idFile *file = fileSystem->OpenFileWrite( path.c_str() );
++	if ( file == NULL ) {
++		common->Warning( "restartLevelFromSave: cannot open '%s' for writing", path.c_str() );
++		return false;
++	}
++	bool ok = len == 0 || file->Write( data, len ) == len;
++	ok = ok && file->Sync();
++	fileSystem->CloseFile( file );
++	if ( !ok ) {
++		common->Warning( "restartLevelFromSave: short write to '%s'", path.c_str() );
++		fileSystem->RemoveFile( path.c_str() );
++	}
++	return ok;
++}
++
++static bool Session_iOS_KeepAutosaveCopy( const idStr &map, const idStr &filter ) {
++	idStr autosaveName = filter.Length() ? va( "Autosave %s %s", map.c_str(), filter.c_str() ) : va( "Autosave %s", map.c_str() );
++	idStr autosaveSlot = autosaveName;
++	sessLocal.ScrubSaveGameFileName( autosaveSlot );
++	if ( !Session_iOS_SaveFileExists( autosaveSlot.c_str() ) ) {
++		common->Printf( "restartLevelFromSave: no autosave '%s' yet - nothing to keep\n", autosaveSlot.c_str() );
++		return true;
++	}
++
++	idStr copyName, copySlot;
++	for ( int n = 1; n <= 9; n++ ) {
++		copyName = autosaveName + ( n == 1 ? " (before restart)" : va( " (before restart %d)", n ) );
++		copySlot = copyName;
++		sessLocal.ScrubSaveGameFileName( copySlot );
++		if ( !Session_iOS_SaveFileExists( copySlot.c_str() ) ) {
++			break;
++		}
++		copySlot.Clear();
++	}
++	if ( copySlot.IsEmpty() ) {
++		common->Warning( "restartLevelFromSave: nine copies of '%s' already kept - not overwriting any", autosaveSlot.c_str() );
++		return false;
++	}
++
++	const idStr from = va( "savegames/%s", autosaveSlot.c_str() );
++	const idStr to = va( "savegames/%s", copySlot.c_str() );
++	idList<byte> bytes;
++	if ( !Session_iOS_ReadSaveSlotFile( from + ".save", bytes ) || bytes.Num() == 0 ) {
++		common->Warning( "restartLevelFromSave: cannot read '%s.save'", from.c_str() );
++		return false;
++	}
++	if ( !Session_iOS_WriteSaveSlotFile( to + ".save", bytes.Ptr(), bytes.Num() ) ) {
++		return false;
++	}
++	if ( Session_iOS_ReadSaveSlotFile( from + ".tga", bytes ) ) {
++		Session_iOS_WriteSaveSlotFile( to + ".tga", bytes.Ptr(), bytes.Num() );
++	}
++
++	// Description sidecar: same tokens, but this slot's name and a label that
++	// says what it is. "^:Map Start\t^0<level>" -> "^:Before restart\t^0<level>".
++	idStr description, screenshot;
++	bool noOverwrite = false;
++	if ( Session_iOS_ReadSaveSlotFile( from + ".txt", bytes ) && bytes.Num() > 0 ) {
++		idLexer src( (const char *)bytes.Ptr(), bytes.Num(), from.c_str(), LEXFL_NOERRORS | LEXFL_NOSTRINGCONCAT );
++		idToken tok;
++		if ( src.ReadToken( &tok ) && src.ReadToken( &tok ) ) {
++			description = tok;
++			if ( src.ReadToken( &tok ) ) {
++				screenshot = tok;
++				if ( src.ReadToken( &tok ) ) {
++					noOverwrite = !idStr::Icmp( tok.c_str(), SESSION_SAVEGAME_NO_OVERWRITE_TOKEN );
++				}
++			}
++		}
++	}
++	// The label column is narrow and an old copy is also prefixed
++	// "[Old version]": "Map Start (before restart)" clipped to "(befo". So the
++	// copy's label REPLACES the generated "Map Start" label; the level column
++	// (after the tab) is kept.
++	{
++		idStr label = "^:";
++		label += OpenQ4_iOS_SaveText( 7 );
++		const int tab = description.Find( '\t' );
++		if ( tab >= 0 ) {
++			label += description.Right( description.Length() - tab );
++		}
++		description = label;
++	}
++	idStr escapedName = copyName;
++	Session_EscapeSaveDescription( escapedName );
++	Session_EscapeSaveDescription( description );
++	idStr text = va( "\"%s\"\n\"%s\"\n\"%s\"\n", escapedName.c_str(), description.c_str(), screenshot.c_str() );
++	if ( noOverwrite ) {
++		text += SESSION_SAVEGAME_NO_OVERWRITE_TOKEN;
++		text += "\n";
++	}
++	if ( !Session_iOS_WriteSaveSlotFile( to + ".txt", text.c_str(), text.Length() ) ) {
++		fileSystem->RemoveFile( ( to + ".save" ).c_str() );
++		fileSystem->RemoveFile( ( to + ".tga" ).c_str() );
++		return false;
++	}
++	common->Printf( "restartLevelFromSave: kept the level's autosave '%s' as '%s' before it is replaced\n", autosaveSlot.c_str(), copySlot.c_str() );
++	return true;
++}
++
++static void Session_RestartLevelFromSave_f( const idCmdArgs &args ) {
++	if ( session_iosRescueSlot.IsEmpty() ) {
++		common->Printf( "restartLevelFromSave: no refused save is waiting to be restarted\n" );
++		return;
++	}
++	if ( sessLocal.IsMultiplayer() ) {
++		common->Printf( "restartLevelFromSave: can't during net play.\n" );
++		return;
++	}
++	// Same module switch LoadGame does, re-running THIS command afterwards
++	// (the slot survives in session_iosRescueSlot; no name crosses the console).
++	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
++	if ( idStr::Icmp( activeModule, "game_sp" ) != 0 ) {
++		cvarSystem->SetCVarString( "si_gameType", "singleplayer" );
++		cvarSystem->SetCVarString( "com_nextGameModule", "game_sp" );
++		idCmdArgs reloadArgs;
++		reloadArgs.AppendArg( "restartLevelFromSave" );
++		cmdSystem->SetupReloadGameModule( reloadArgs );
++		return;
++	}
++	const idStr slot = session_iosRescueSlot;
++	session_iosRescueSlot.Clear();
++
++	idStr map, filter;
++	idDict playerInfo;
++	const int verdict = Session_iOS_ProbeSaveGame( slot.c_str(), &map, &filter, &playerInfo );
++	if ( map.IsEmpty() || verdict == 3 || verdict == 4 ) {
++		common->Warning( "restartLevelFromSave: '%s' no longer names a level that can be started (reason %d)", slot.c_str(), verdict );
++		// The player pressed YES; a console line alone is not an answer.
++		Session_iOS_MenuUnderSaveBox();
++		sessLocal.MessageBox( MSG_OK, OpenQ4_iOS_SaveText( verdict == 3 ? 4 : 5 ), OpenQ4_iOS_SaveText( 1 ), false );
++		return;
++	}
++	if ( !Session_iOS_KeepAutosaveCopy( map, filter ) ) {
++		common->Warning( "restartLevelFromSave: the level's autosave could not be kept aside - not restarting, nothing changed" );
++		Session_iOS_MenuUnderSaveBox();
++		sessLocal.MessageBox( MSG_OK, OpenQ4_iOS_SaveText( 8 ), OpenQ4_iOS_SaveText( 1 ), false );
++		return;
++	}
++	common->Printf( "restartLevelFromSave: '%s' -> starting %s%s%s from the beginning with the saved inventory (%d keys)\n",
++		slot.c_str(), map.c_str(), filter.Length() ? " " : "", filter.c_str(), playerInfo.GetNumKeyVals() );
++	console->Close();
++	session_iosStartPlayerInfo = &playerInfo;
++	sessLocal.StartNewGame( map.c_str(), false, filter.c_str() );
++	session_iosStartPlayerInfo = NULL;
++}
++#endif
++
++/*
++===============
+ SaveGame_f
+ ===============
+ */
+@@ -7267,6 +7916,54 @@
+ 		~PacifierScope() { active = false; }
+ 	} scope( insidePacifierUpdate );
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// This — not Printf — is the engine's own "I am inside a blocking load"
++	// callback. It fires from every file read (idFileSystemLocal::AddToReadCount)
++	// as well as every print, so it covers the long silent stretches that the
++	// Printf hook could not: a map load prints almost nothing, which is why the
++	// app went unresponsive during one and iOS killed it.
++	//
++	// The main-alive bump belongs here too. Until now that counter was raised
++	// only by the display-link tick and the Printf hook, so a pacifier-driven
++	// load looked identical to a wedge — the instrument was conflating "blocked"
++	// with "working but not printing".
++	OpenQ4_iOS_NoteMainAlive();
++
++	// NOTE the absence of run-loop servicing here, which is deliberate and is
++	// the fix for the scene-update watchdog kill. Servicing the run loop in 2 ms
++	// slices from inside a blocking load lets the system start scene round trips
++	// the app cannot finish; a fully blocked app arms nothing and survives
++	// indefinitely (measured: 109 s blocked vs 10-11 s half-serviced). The
++	// prologue in OpenQ4_iOS_LoadProgress puts the UI into a committed, static
++	// state first, and then this stays out of the way.
++	//
++	// The servicing during common->Init() stays: that regime has never taken
++	// this kill, and its overlay updates are genuinely useful.
++
++	// And then return, WITHOUT drawing a loading-screen frame.
++	//
++	// The pacifier renders a frame roughly every 16 ms during a map change.
++	// Each of those ends in GLimp_SwapBuffers -> vkQueueSubmit2 ->
++	// MVKPresentableSwapchainImage::getCAMetalDrawable(), and a CAMetalLayer has
++	// three drawables. Inside a blocking load the main thread never returns to
++	// its run loop properly, so presented drawables are not recycled, the pool
++	// exhausts, and the acquire blocks — permanently. Sampling the maintainer's device
++	// at +78 s, +108 s and +168 s produced the identical stack sitting in
++	// getCAMetalDrawable, which is the whole of the "campaign never loads".
++	//
++	// This is quake3e's D-019 freeze #1 in a new costume: there, MoltenVK's
++	// nextDrawable retry wedged a hidden window; here it is a window whose run
++	// loop is blocked. Their fix was to stop touching the swapchain in that
++	// state, and so is this one.
++	//
++	// The player is not left staring at a frozen frame: the shell puts its own
++	// UIKit overlay up with the current asset name, driven from the activity
++	// string the watchdog already samples, and tears it down on the first
++	// display-link frame after the load finishes.
++	OpenQ4_iOS_LoadProgress();
++	return;
++#endif
++
+ #ifdef ID_DEDICATED
+ 	// Dedicated map loads have no client presentation path, but the server
+ 	// pacifier must still run often enough to keep connected clients alive.
+@@ -7603,16 +8300,64 @@
+ 
+ 	renderSystem->SetLoadingScreenSwapIntervalBypass( insideExecuteMapChange );
+ 
++#if defined( OPENQ4_VISIONOS_3D )
++	/*
++	 * visionOS 3D: render the COMPLETE composite twice per engine frame, left
++	 * eye then right, at the SAME GAME TIME (openQ4-ios D-101,
++	 * docs/stereo-design.md §1; charter Phase 6 settled law).
++	 *
++	 * Frame() has already run, so nothing ticks between the two passes: Draw()
++	 * is a pure re-emission of the same world state, and the only thing that
++	 * differs is tr_stereoEye, which R_SetViewMatrix and R_SetupProjection read
++	 * to place the eye. The game module is untouched — it is a separate dylib
++	 * and it never learns that there are two eyes.
++	 *
++	 * Doubling HERE and not inside the renderer is what keeps the HUD, menus
++	 * and console in the stereo pair: they are emitted by Draw(), so a second
++	 * RenderScene would have missed all three.
++	 *
++	 * Watch items, resolved:
++	 *  - tr.deltaTime is recomputed from tr.lastRenderTimeMsec inside
++	 *    RenderScene, so the right eye sees ~0. Its only consumer is
++	 *    idMD5Mesh::UpdateLod's animation-LOD accumulator, which now takes the
++	 *    full delta on the left eye and ~0 on the right: one host frame's worth
++	 *    of time per host frame, which is exactly right.
++	 *  - tr.frameCount advances twice per host frame. That is REQUIRED, not
++	 *    tolerated: it is the "already visited this frame" key for the view
++	 *    caches, and sharing it between the eyes would make the second eye
++	 *    reuse the first eye's culled/lit results.
++	 */
++	const bool stereoPair = R_Stereo_Enabled();
++	const int numEyes = stereoPair ? 2 : 1;
++	for ( int eyePass = 0; eyePass < numEyes; eyePass++ ) {
++		R_Stereo_SetEye( stereoPair ? ( eyePass + 1 ) : 0 );
++#endif
++
+ 	renderSystem->BeginFrame( renderSystem->GetScreenWidth(), renderSystem->GetScreenHeight() );
+ 
+ 	// draw everything
+ 	Draw();
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// After Draw(), before EndFrame(): the last 2D geometry of the frame, so it
++	// covers the world, the HUD, the menus and the console alike. Inside Draw()
++	// would miss the paths that return early from it.
++	Session_iOSApplyBrightness();
++#endif
++
+ 	if ( com_speeds.GetBool() ) {
+ 		renderSystem->EndFrame( &time_frontend, &time_backend );
+ 	} else {
+ 		renderSystem->EndFrame( NULL, NULL );
++	}
++
++#if defined( OPENQ4_VISIONOS_3D )
+ 	}
++	// Back to mono for anything that renders outside this function (screenshot
++	// and capture paths open their own frames), so a stray frame can never
++	// carry half a pair's worth of eye offset.
++	R_Stereo_SetEye( 0 );
++#endif
+ 
+ 	insideUpdateScreen = false;
+ }
+@@ -8115,7 +8860,11 @@
+ 	cmdSystem->AddCommand( "openq4_browser", Session_OpenQ4Browser_f, CMD_FL_SYSTEM | CMD_FL_CHEAT, "reports and exercises main-menu server-browser operations for engine-scripted validation" );
+ 	cmdSystem->AddCommand( "saveGame", SaveGame_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "saves a game" );
+ 	cmdSystem->AddCommand( "loadGame", LoadGame_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "loads a game", idCmdSystem::ArgCompletion_SaveGame );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	cmdSystem->AddCommand( "loadNewestGame", Session_LoadNewestGame_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "loads the newest savegame this build can load (openq4://continue)" );
++	cmdSystem->AddCommand( "restartLevelFromSave", Session_RestartLevelFromSave_f, CMD_FL_SYSTEM|CMD_FL_CHEAT, "starts the level of the last refused older-format save from its beginning, with its saved inventory" );
+ #endif
++#endif
+ 
+ 	cmdSystem->AddCommand( "takeViewNotes", TakeViewNotes_f, CMD_FL_SYSTEM, "take notes about the current map from the current view" );
+ 	cmdSystem->AddCommand( "takeViewNotes2", TakeViewNotes2_f, CMD_FL_SYSTEM, "extended take view notes" );

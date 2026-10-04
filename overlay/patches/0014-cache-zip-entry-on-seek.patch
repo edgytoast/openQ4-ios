@@ -1,0 +1,155 @@
+--- a/src/framework/File.cpp
++++ b/src/framework/File.cpp
+@@ -1451,15 +1451,68 @@
+ 	zipFilePos = 0;
+ 	fileSize = 0;
+ 	containerChecksum = 0;
++	cachedData = NULL;
++	cachedPos = 0;
+ 	memset( &z, 0, sizeof( z ) );
+ }
+ 
+ /*
++=================
++idFile_InZip::EnsureCached
++
++Inflate the whole entry once so that seeking becomes arithmetic instead of
++decompression. See the comment on cachedData in File.h for why.
+ =================
++*/
++bool idFile_InZip::EnsureCached( void ) {
++	if ( cachedData != NULL ) {
++		return true;
++	}
++	if ( fileSize <= 0 ) {
++		return false;
++	}
++
++	const int resumePos = unztell( z );
++
++	if ( unzSetCurrentFileInfoPosition( z, static_cast<unsigned long>( zipFilePos ) ) != UNZ_OK ||
++			unzOpenCurrentFile( z ) != UNZ_OK ) {
++		return false;
++	}
++
++	byte *buf = static_cast<byte *>( Mem_Alloc( fileSize ) );
++	if ( buf == NULL ) {
++		return false;
++	}
++
++	int total = 0;
++	while ( total < fileSize ) {
++		const int block = Min( fileSize - total, 64 * 1024 );
++		const int l = unzReadCurrentFile( z, buf + total, block );
++		if ( l <= 0 ) {
++			break;
++		}
++		total += l;
++	}
++	if ( total != fileSize ) {
++		Mem_Free( buf );
++		return false;
++	}
++
++	cachedData = buf;
++	cachedPos = ( resumePos > 0 && resumePos <= fileSize ) ? resumePos : 0;
++	return true;
++}
++
++/*
++=================
+ idFile_InZip::~idFile_InZip
+ =================
+ */
+ idFile_InZip::~idFile_InZip( void ) {
++	if ( cachedData != NULL ) {
++		Mem_Free( cachedData );
++		cachedData = NULL;
++	}
+ 	unzCloseCurrentFile( z );
+ 	unzClose( z );
+ }
+@@ -1476,6 +1529,17 @@
+ 	if ( len <= 0 || buffer == NULL ) {
+ 		return 0;
+ 	}
++	if ( cachedData != NULL ) {
++		const int avail = fileSize - cachedPos;
++		const int n = Min( len, avail );
++		if ( n <= 0 ) {
++			return 0;
++		}
++		memcpy( buffer, cachedData + cachedPos, n );
++		cachedPos += n;
++		return n;
++	}
++
+ 	byte *buf = static_cast<byte *>( buffer );
+ 	int totalRead = 0;
+ 
+@@ -1536,6 +1600,9 @@
+ =================
+ */
+ int idFile_InZip::Tell( void ) {
++	if ( cachedData != NULL ) {
++		return cachedPos;
++	}
+ 	return unztell( z );
+ }
+ 
+@@ -1570,6 +1637,26 @@
+ 	int res, i;
+ 	char *buf;
+ 
++	// A seek is the signal that this file will be read non-sequentially, so
++	// materialise it and answer this and every later seek from memory. Falls
++	// through to the original re-inflating path if the entry cannot be cached.
++	if ( EnsureCached() ) {
++		long target;
++		switch( origin ) {
++			case FS_SEEK_SET: target = offset; break;
++			case FS_SEEK_CUR: target = cachedPos + offset; break;
++			case FS_SEEK_END: target = fileSize - offset; break;
++			default:
++				common->FatalError( "idFile_InZip::Seek: bad origin for %s\n", name.c_str() );
++				return -1;
++		}
++		if ( target < 0 || target > fileSize ) {
++			return -1;
++		}
++		cachedPos = static_cast<int>( target );
++		return 0;
++	}
++
+ 	switch( origin ) {
+ 		case FS_SEEK_END: {
+ 			offset = fileSize - offset;
+--- a/src/framework/File.h
++++ b/src/framework/File.h
+@@ -286,6 +286,26 @@
+ 	int						fileSize;		// size of the file
+ 	int						containerChecksum;
+ 	void *					z;				// unzip info
++
++	/*
++	 * Decompressed contents, materialised on the first seek.
++	 *
++	 * Seeking inside a zip entry is not seeking: FS_SEEK_SET reopens the entry
++	 * and re-inflates it from the beginning, discarding bytes until it reaches
++	 * the target. A parser that seeks repeatedly therefore re-inflates the whole
++	 * entry once per seek, which is quadratic in the file size.
++	 *
++	 * The LightWave model loader (lwGetObject/lwGetSurface/getS0) seeks
++	 * constantly, and sampling an iPhone during a Quake 4 map load caught the
++	 * main thread inside crc32 under idFile_InZip::Seek — the re-inflation —
++	 * with the load never completing.
++	 *
++	 * Sequential reads keep the streaming path, so large assets that are read
++	 * straight through (sounds, video) never allocate this.
++	 */
++	byte *					cachedData;
++	int						cachedPos;
++	bool					EnsureCached( void );
+ };
+ 
+ #endif /* !__FILE_H__ */

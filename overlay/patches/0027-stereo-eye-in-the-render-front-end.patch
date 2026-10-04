@@ -1,0 +1,129 @@
+--- a/src/renderer/tr_main.cpp
++++ b/src/renderer/tr_main.cpp
+@@ -821,7 +821,83 @@
+ float tr_levelshotProjectionShiftX = 0.0f;
+ float tr_levelshotProjectionShiftY = 0.0f;
+ 
++#if defined( OPENQ4_VISIONOS_3D )
+ /*
++===============================================================================
++
++	visionOS stereo 3D — where the eye enters the front end
++	(openQ4-ios D-101, docs/stereo-design.md §1).
++
++	The eye is a POST-TRANSLATION along view-space X in R_SetViewMatrix plus an
++	off-axis skew in R_SetupProjection. renderView.vieworg / viewaxis are never
++	touched, so R_SetupViewFrustum, portal visibility and light culling all keep
++	the CENTRE camera: the cull frustum is symmetric while the projection is
++	not, which costs at most a sliver at one edge (the skew is e/conv ~ 1 % of
++	half-width at the defaults) and buys the charter's "honest path, no
++	camera-basis folds" without a second culling pass per eye.
++
++	Two consequences that are features, not oversights:
++
++	  - Subviews (mirrors, remote cameras, RF_PORTAL_SKY, in-world GUI surfaces)
++	    inherit the current eye for free, because they run through these same
++	    two functions.
++	  - 2D views (idGuiModel::EmitFullScreen) never call either one — they build
++	    their own ortho projection and an identity worldSpace — so the HUD, the
++	    crosshair, the menus and the console land at ZERO parallax, i.e. exactly
++	    on the panel. That is quake3e's "HUD at panel depth" rule obtained by
++	    construction rather than by a special case.
++
++	The weapon viewmodel is the one surface class that must NOT take the world's
++	convergence; it is re-derived in VK_BuildSurfMVP (vk_GuiExecutor.cpp) from
++	tr_stereoEyeOffset, which is why that value is a global here rather than a
++	local of R_SetViewMatrix.
++
++===============================================================================
++*/
++idCVar r_stereo3dSeparation( "r_stereo3dSeparation", "2.5", CVAR_RENDERER | CVAR_FLOAT,
++		"visionOS 3D: interocular distance in world units (2.5 ~ a human IPD at Quake scale)" );
++idCVar r_stereo3dConvergence( "r_stereo3dConvergence", "240", CVAR_RENDERER | CVAR_FLOAT,
++		"visionOS 3D: distance in world units that sits exactly on the panel (zero parallax)" );
++
++// 0 = mono, 1 = left, 2 = right. Latched once per engine frame by
++// idSessionLocal::UpdateScreen, never mid-frame.
++int		tr_stereoEye = 0;
++// The latched eye's view-space X offset, in world units. Derived from the eye
++// ONCE per frame rather than read from the cvar per view, so a cvar written
++// between the two eyes of a pair cannot produce a mismatched pair.
++float	tr_stereoEyeOffset = 0.0f;
++
++void R_Stereo_SetEye( int eye ) {
++	tr_stereoEye = eye;
++	if ( eye != 1 && eye != 2 ) {
++		tr_stereoEyeOffset = 0.0f;
++		return;
++	}
++	const float sep = r_stereo3dSeparation.GetFloat();
++	tr_stereoEyeOffset = ( eye == 2 ) ? ( 0.5f * sep ) : ( -0.5f * sep );
++}
++
++int R_Stereo_Eye( void ) {
++	return tr_stereoEye;
++}
++
++// Declared in renderer/Vulkan/vk_GuiExecutor.cpp, which owns the present images
++// the two eyes are rendered into (D-100). Same renderer module, so this is a
++// plain extern and not a cvarSystem lookup: a per-frame string lookup for a
++// value read twice a frame would be the wrong trade, and a stale cached pointer
++// would be worse.
++extern idCVar r_stereo3d;
++
++// The doubling gate, read ONCE per engine frame by idSessionLocal::UpdateScreen.
++// Deliberately the CVAR and not the backend's latched vk3dActive: the latch is
++// updated inside BeginFrame, i.e. after this is asked, so asking the latch would
++// render the first frame of every entry as an unpaired mono frame.
++bool R_Stereo_Enabled( void ) {
++	return r_stereo3d.GetBool();
++}
++#endif
++
++/*
+ =================
+ R_SetViewMatrix
+ 
+@@ -876,6 +952,17 @@
+ 	// convert from our coordinate system (looking down X)
+ 	// to OpenGL's coordinate system (looking down -Z)
+ 	myGlMultMatrix( viewerMatrix, s_flipMatrix, world->modelViewMatrix );
++
++#if defined( OPENQ4_VISIONOS_3D )
++	// The eye, as a post-translation in GL eye space. Element 12 IS the eye-space
++	// x translation of the composed matrix (s_flipMatrix is applied on the left,
++	// so the translation column is already in GL eye space), and columns 0-2 are
++	// untouched: this moves the camera sideways without rotating it and without
++	// disturbing anything derived from vieworg/viewaxis.
++	if ( tr_stereoEyeOffset != 0.0f ) {
++		world->modelViewMatrix[ 12 ] -= tr_stereoEyeOffset;
++	}
++#endif
+ }
+ 
+ /*
+@@ -966,6 +1053,24 @@
+ 	tr.viewDef->projectionMatrix[11] = -1;
+ 	tr.viewDef->projectionMatrix[15] = 0;
+ 
++#if defined( OPENQ4_VISIONOS_3D )
++	// Off-axis skew, applied to the SAME element the asymmetric-frustum
++	// mechanism above writes. Derivation: with the camera at +e in eye space a
++	// point at depth `conv` projects to (P0*(x-e) + P8*(-conv)) / conv, which
++	// equals the mono P0*x/conv exactly when P8 = -P0*e/conv. So objects at
++	// `conv` sit on the panel, nearer ones come out of it and further ones go
++	// behind it — the "Crosshair Distance" row is this cvar.
++	//
++	// Applied AFTER the jitter/levelshot shifts rather than folded into
++	// xmin/xmax, because those shift the frustum symmetrically in both
++	// directions and this must not move the near plane.
++	if ( tr_stereoEyeOffset != 0.0f ) {
++		const float conv = Max( r_stereo3dConvergence.GetFloat(), 1.0f );
++		tr.viewDef->projectionMatrix[8] -=
++				tr.viewDef->projectionMatrix[0] * tr_stereoEyeOffset / conv;
++	}
++#endif
++
+ 	R_TemporalPresentation_FinalizeViewProjection( tr.viewDef );
+ }
+ 

@@ -1,0 +1,222 @@
+--- a/src/framework/async/AsyncNetwork.cpp
++++ b/src/framework/async/AsyncNetwork.cpp
+@@ -31,6 +31,29 @@
+ 
+ #include "AsyncNetwork.h"
+ #include "../ArenaCampaign.h"
++
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
++
++/*
++ * openQ4-ios overlay: the default slot-0 master.
++ *
++ * id's own master (IDNET_HOST = q4master.idsoftware.com) still resolves but has
++ * served nothing for years, so an Internet tab pointed at it can only ever come
++ * back empty. master.quakehub.net is the live community master for Quake 4 — it
++ * answered a getServers probe with 20 servers on 2026-09-10, its page was last
++ * updated July 2026, and it forwards slot-0 client authorisation traffic on to
++ * id's master, which is why it belongs in slot 0 (ROM) rather than in one of
++ * the archived net_master1..4 slots.
++ *
++ * iOS only, because changing the default for every platform is upstream's call.
++ */
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	#define OPENQ4_DEFAULT_MASTER		"master.quakehub.net:" IDNET_MASTER_PORT
++#else
++	#define OPENQ4_DEFAULT_MASTER		IDNET_HOST ":" IDNET_MASTER_PORT
++#endif
+ 
+ idAsyncServer		idAsyncNetwork::server;
+ idAsyncClient		idAsyncNetwork::client;
+@@ -78,7 +101,7 @@
+ idCVar				idAsyncNetwork::clientRemoteConsoleAddress( "net_clientRemoteConsoleAddress", "localhost", CVAR_SYSTEM | CVAR_NOCHEAT, "remote console address" );
+ idCVar				idAsyncNetwork::clientRemoteConsolePassword( "net_clientRemoteConsolePassword", "", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_PRIVATE | CVAR_CASE_SENSITIVE, "private remote console password" );
+ idCVar				idAsyncNetwork::clientUseLegacyRcon( "net_clientUseLegacyRcon", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NOCHEAT, "send the insecure legacy plaintext rcon protocol" );
+-idCVar				idAsyncNetwork::master0( "net_master0", IDNET_HOST ":" IDNET_MASTER_PORT, CVAR_SYSTEM | CVAR_ROM, "idnet master server address" );
++idCVar				idAsyncNetwork::master0( "net_master0", OPENQ4_DEFAULT_MASTER, CVAR_SYSTEM | CVAR_ROM, "master server address" );
+ idCVar				idAsyncNetwork::master1( "net_master1", "", CVAR_SYSTEM | CVAR_ARCHIVE, "1st master server address" );
+ idCVar				idAsyncNetwork::master2( "net_master2", "", CVAR_SYSTEM | CVAR_ARCHIVE, "2nd master server address" );
+ idCVar				idAsyncNetwork::master3( "net_master3", "", CVAR_SYSTEM | CVAR_ARCHIVE, "3rd master server address" );
+@@ -163,6 +186,20 @@
+ idAsyncNetwork::Init
+ ==================
+ */
++/*
++ * openQ4-ios overlay (upstreaming candidate): a console entry point for the
++ * Internet server query.
++ *
++ * "LANScan" and "listServers" have always been commands; the master query was
++ * reachable only by clicking UpdateServers in the multiplayer GUI, which makes
++ * it untestable from a script — and on a touch port the script IS the test rig.
++ * Deliberately a free function rather than a new idAsyncNetwork static, so the
++ * overlay does not have to carry a header edit as well.
++ */
++static void OpenQ4_NetScan_f( const idCmdArgs &args ) {
++	idAsyncNetwork::GetNETServers();
++}
++
+ void idAsyncNetwork::Init( void ) {
+ 
+ 	realTime = 0;
+@@ -183,6 +220,7 @@
+ 	cmdSystem->AddCommand( "serverInfo", GetServerInfo_f, CMD_FL_SYSTEM, "shows server info" );
+ 	cmdSystem->AddCommand( "LANScan", GetLANServers_f, CMD_FL_SYSTEM, "scans LAN for servers" );
+ 	cmdSystem->AddCommand( "listServers", ListServers_f, CMD_FL_SYSTEM, "lists scanned servers" );
++	cmdSystem->AddCommand( "netScan", OpenQ4_NetScan_f, CMD_FL_SYSTEM, "queries the master servers for the internet server list" );
+ 	cmdSystem->AddCommand( "rcon", RemoteConsole_f, CMD_FL_SYSTEM, "sends an authenticated remote console command to the server" );
+ 	cmdSystem->AddCommand( "heartbeat", Heartbeat_f, CMD_FL_SYSTEM, "send a heartbeat to the the master servers" );
+ 	cmdSystem->AddCommand( "kick", Kick_f, CMD_FL_SYSTEM, "kick a client by connection number" );
+--- a/src/framework/async/AsyncClient.cpp
++++ b/src/framework/async/AsyncClient.cpp
+@@ -573,6 +573,31 @@
+ idAsyncClient::GetNETServers
+ ==================
+ */
++/*
++ * openQ4-ios overlay (upstreaming candidate): is this packet from a master?
++ *
++ * Every master gate in this file used the no-argument GetMasterAddress(), which
++ * is hardcoded to slot 0 — so net_master1..4 could be set, and were consulted
++ * by the SERVER's heartbeat loop, but any reply they sent the client was thrown
++ * away as "not a valid master". Resolution is cached inside GetMasterAddress
++ * (it only re-resolves when the cvar is modified), so this is not a DNS hit per
++ * packet.
++ */
++// Servers dropped by the protocol gate since the last master query. A file
++// static rather than an idAsyncClient member, so the overlay does not have to
++// carry a header edit for a diagnostic counter.
++static int OpenQ4_protocolRejects = 0;
++
++static bool OpenQ4_IsFromAnyMaster( const netadr_t from ) {
++	for ( int i = 0; i < MAX_MASTER_SERVERS; i++ ) {
++		netadr_t adr;
++		if ( idAsyncNetwork::GetMasterAddress( i, adr ) && Sys_CompareNetAdrBase( adr, from ) ) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ void idAsyncClient::GetNETServers( void ) {
+ 	idBitMsg	msg;
+ 	byte		msgBuf[MAX_MESSAGE_SIZE];
+@@ -599,8 +624,17 @@
+ 	const int masterGameTypeFilter = ( localGameTypeFilter >= 0 && localGameTypeFilter <= 3 ) ? localGameTypeFilter : 0;
+ 	msg.WriteBits( masterGameTypeFilter, 2 );
+ 
+-	netadr_t adr;
+-	if ( idAsyncNetwork::GetMasterAddress( 0, adr ) ) {
++	// openQ4-ios overlay (upstreaming candidate): ask EVERY configured master,
++	// not only slot 0. Replies are accepted from any of them (see
++	// OpenQ4_IsFromAnyMaster), which is what makes net_master1..4 mean something
++	// on the client for the first time — the user's escape hatch if the default
++	// master goes the way of id's.
++	int sent = 0;
++	for ( int i = 0; i < MAX_MASTER_SERVERS; i++ ) {
++		netadr_t adr;
++		if ( !idAsyncNetwork::GetMasterAddress( i, adr ) ) {
++			continue;
++		}
+ 		clientPort.SendPacket( adr, msg.GetData(), msg.GetSize() );
+ 
+ 		// Ask for the address-family tagged list as well. A master that does
+@@ -618,7 +652,13 @@
+ 		extMsg.WriteBits( cvarSystem->GetCVarInteger( "gui_filter_players" ), 2 );
+ 		extMsg.WriteBits( masterGameTypeFilter, 2 );
+ 		clientPort.SendPacket( adr, extMsg.GetData(), extMsg.GetSize() );
++		common->Printf( "getServers: sent to master%d %s\n", i, Sys_NetAdrToString( adr ) );
++		sent++;
++	}
++	if ( sent == 0 ) {
++		common->Printf( "getServers: no master server is configured (net_master0..4 are all empty or unresolvable)\n" );
+ 	}
++	OpenQ4_protocolRejects = 0;
+ }
+ 
+ /*
+@@ -632,6 +672,10 @@
+ 	for ( i = 0; i < serverList.Num(); i++ ) {
+ 		common->Printf( "%3d: %s %dms (%s)\n", i, serverList[i].serverInfo.GetString( "si_name" ), serverList[ i ].ping, Sys_NetAdrToString( serverList[i].adr ) );
+ 	}
++	// openQ4-ios overlay: an empty list has two very different causes, and this
++	// is the line that tells them apart.
++	common->Printf( "%d server(s) listed; %d answered but were dropped on protocol (openQ4 is %d.%d)\n",
++					serverList.Num(), OpenQ4_protocolRejects, ASYNC_PROTOCOL_MAJOR, ASYNC_PROTOCOL_MINOR );
+ }
+ 
+ /*
+@@ -1757,7 +1801,13 @@
+ 	serverInfo.challenge = msg.ReadLong();			// challenge
+ 	protocol = msg.ReadLong();
+ 	if ( protocol != ASYNC_PROTOCOL_VERSION ) {
+-		common->Printf( "server %s ignored - protocol %d.%d, expected %d.%d\n", Sys_NetAdrToString( serverInfo.adr ), protocol >> 16, protocol & 0xffff, ASYNC_PROTOCOL_MAJOR, ASYNC_PROTOCOL_MINOR );
++		// openQ4-ios overlay: count them as well as printing them. The public
++		// Quake 4 masters list RETAIL 1.4.2 servers, which are protocol 2.85,
++		// and openQ4 is 2.41 — so a browser that fetched twenty servers and
++		// shows an empty list is the expected outcome, not a broken query, and
++		// the only way to tell the two apart was to read every console line.
++		OpenQ4_protocolRejects++;
++		common->Printf( "server %s ignored - protocol %d.%d, expected %d.%d (%d rejected so far)\n", Sys_NetAdrToString( serverInfo.adr ), protocol >> 16, protocol & 0xffff, ASYNC_PROTOCOL_MAJOR, ASYNC_PROTOCOL_MINOR, OpenQ4_protocolRejects );
+ 		return;
+ 	}
+ 	msg.ReadDeltaDict( serverInfo.serverInfo, NULL );
+@@ -1836,15 +1886,18 @@
+ ==================
+ */
+ void idAsyncClient::ProcessServersListMessage( const netadr_t from, const idBitMsg &msg ) {
+-	if ( !Sys_CompareNetAdrBase( idAsyncNetwork::GetMasterAddress(), from ) ) {
++	if ( !OpenQ4_IsFromAnyMaster( from ) ) {
+ 		common->DPrintf( "received a server list from %s - not a valid master\n", Sys_NetAdrToString( from ) );
+ 		return;
+ 	}
++	int added = 0;
+ 	while ( msg.GetRemaingData() >= 6 ) {
+ 		int a,b,c,d;
+ 		a = msg.ReadByte(); b = msg.ReadByte(); c = msg.ReadByte(); d = msg.ReadByte();
+ 		serverList.AddServer( serverList.Num(), va( "%i.%i.%i.%i:%i", a, b, c, d, msg.ReadUShort() ) );
++		added++;
+ 	}
++	common->Printf( "servers: %d address(es) from master %s\n", added, Sys_NetAdrToString( from ) );
+ 	if ( msg.GetRemaingData() != 0 ) {
+ 		common->DPrintf( "received a malformed server list from %s - trailing address data ignored\n", Sys_NetAdrToString( from ) );
+ 	}
+@@ -1864,12 +1917,13 @@
+ ==================
+ */
+ void idAsyncClient::ProcessServersListExtMessage( const netadr_t from, const idBitMsg &msg ) {
+-	if ( !Sys_CompareNetAdrBase( idAsyncNetwork::GetMasterAddress(), from ) ) {
++	if ( !OpenQ4_IsFromAnyMaster( from ) ) {
+ 		common->DPrintf( "received an extended server list from %s - not a valid master\n", Sys_NetAdrToString( from ) );
+ 		return;
+ 	}
+ 
+ 	bool malformed = false;
++	int added = 0;
+ 	while ( msg.GetRemaingData() > 0 ) {
+ 		const int separator = msg.ReadByte();
+ 		int addressBytes;
+@@ -1919,11 +1973,13 @@
+ 		}
+ 
+ 		serverList.AddServer( serverList.Num(), Sys_NetAdrToString( server ) );
++		added++;
+ 	}
+ 
+ 	if ( malformed ) {
+ 		common->DPrintf( "received a malformed extended server list from %s - trailing address data ignored\n", Sys_NetAdrToString( from ) );
+ 	}
++	common->Printf( "servers: %d address(es) from master %s\n", added, Sys_NetAdrToString( from ) );
+ }
+ 
+ /*
+@@ -2131,7 +2187,7 @@
+ 	}
+ 
+ 	// from master server:
+-	if ( Sys_CompareNetAdrBase( from, idAsyncNetwork::GetMasterAddress( ) ) ) {
++	if ( OpenQ4_IsFromAnyMaster( from ) ) {
+ 		// server list
+ 		if ( idStr::Icmp( string, "servers" ) == 0 ) {
+ 			ProcessServersListMessage( from, msg );

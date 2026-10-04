@@ -1,0 +1,315 @@
+--- a/src/framework/Common.cpp
++++ b/src/framework/Common.cpp
+@@ -30,6 +30,9 @@
+ 
+ 
+ //#include "../renderer/Image.h"
++#if defined( __APPLE__ )
++#include <TargetConditionals.h>
++#endif
+ #include "../bse/BSE_API.h"
+ #include "../imagetools/ImageTools.h"
+ #include "../render_geo/RenderGeometry.h"
+@@ -48,6 +51,16 @@
+ #define MAX_WARNING_LIST	256
+ 
+ void openQ4_PrintFramePacingSnapshot( const char *reason );
++
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++// Declared locally rather than by including the app shell's header: the engine
++// should not reach into the shell's include tree, and this keeps the overlay
++// patch self-contained.
++extern "C" void OpenQ4_iOS_ServiceRunLoopDuringInit( void );
++extern "C" void OpenQ4_iOS_TraceLine( const char *line );
++extern "C" void OpenQ4_iOS_LoadProgressDone( void );
++extern "C" void OpenQ4_iOS_BlackBox( const char *fmt, ... ) __attribute__((format(printf, 1, 2)));
++#endif
+ void openQ4_RecordMultiplayerFramePacing( int frameStartMsec );
+ 
+ static const int OPENQ4_ENTITYDEF_MEDIA_CACHE_TOOL_MASK =
+@@ -139,7 +152,7 @@
+ idCVar com_videoRam( "com_videoRam", "64", CVAR_INTEGER | CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_ARCHIVE, "holds the last amount of detected video ram" );
+ idCVar com_activeGameModule( "com_activeGameModule", "", CVAR_SYSTEM | CVAR_NOCHEAT, "active game module (game_sp/game_mp)" );
+ idCVar com_nextGameModule( "com_nextGameModule", "", CVAR_SYSTEM | CVAR_NOCHEAT, "internal one-shot game module override for reloadEngine" );
+-idCVar com_platformProfile( "com_platformProfile", "default", CVAR_SYSTEM | CVAR_INIT, "startup platform profile (default or steamdeck)" );
++idCVar com_platformProfile( "com_platformProfile", "default", CVAR_SYSTEM | CVAR_INIT, "startup platform profile (default, steamdeck or ios)" );
+ 
+ static bool openQ4_IsValidGameModuleName( const char *moduleName );
+ 
+@@ -373,6 +386,15 @@
+ static bool commonLoadingContinueInputActive = false;
+ 
+ void openQ4_SetLoadingContinueInputActive( bool active ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// The engine is about to draw its own "press any key to continue" screen and
++	// wait for input. The shell's UIKit loading overlay is a key window sitting
++	// ABOVE the SDL window, so leaving it up would cover that screen and swallow
++	// every tap aimed at it. This is the exact moment it has to go.
++	if ( active ) {
++		OpenQ4_iOS_LoadProgressDone();
++	}
++#endif
+ 	commonLoadingContinueInputActive = active;
+ }
+ 
+@@ -786,7 +808,17 @@
+ 	if ( sanitized.Length() == 0 || sanitized.Icmp( "default" ) == 0 ) {
+ 		return "";
+ 	}
+-	if ( sanitized.Icmp( "steamdeck" ) != 0 ) {
++	// Allowlist, so a stray com_platformProfile cannot make the engine exec an
++	// arbitrary file name from the search path.
++	static const char *const kKnownProfiles[] = { "steamdeck", "ios" };
++	bool known = false;
++	for ( int i = 0; i < (int)( sizeof( kKnownProfiles ) / sizeof( kKnownProfiles[0] ) ); i++ ) {
++		if ( sanitized.Icmp( kKnownProfiles[i] ) == 0 ) {
++			known = true;
++			break;
++		}
++	}
++	if ( !known ) {
+ 		return "";
+ 	}
+ 
+@@ -1014,6 +1046,16 @@
+ 		return;
+ 	}
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Straight to a file descriptor from this thread, bypassing the shell's
++	// stdout pipe entirely. Anything sitting in that pipe when the process is
++	// killed is lost, and it is always the last few lines that matter — the
++	// ones naming what the engine was doing when it died. write() hands the
++	// bytes to the kernel, which keeps them even if the process never runs
++	// again.
++	OpenQ4_iOS_TraceLine( msg );
++#endif
++
+ 	// echo to console buffer
+ 	console->Print( msg );
+ 
+@@ -1128,6 +1170,13 @@
+ 	va_start( argptr, fmt );
+ 	VPrintf( fmt, argptr );
+ 	va_end( argptr );
++
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Init runs on the main thread and takes ~22 seconds; iOS kills an app whose
++	// main thread does not service its run loop. Printf is the one call site
++	// that is both frequent and evenly spread across the whole of startup.
++	OpenQ4_iOS_ServiceRunLoopDuringInit();
++#endif
+ }
+ 
+ /*
+@@ -1323,6 +1372,20 @@
+ ==================
+ */
+ void idCommonLocal::Error( const char *fmt, ... ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	{
++		va_list ap;
++		char msg[1024];
++		va_start( ap, fmt );
++		idStr::vsnPrintf( msg, sizeof( msg ) - 1, fmt, ap );
++		va_end( ap );
++		// Into the black box directly. An engine error that ends in exit()
++		// leaves no signal, no crash report and an abruptly-truncated log — it
++		// is indistinguishable from an OS kill from the outside, which is
++		// exactly the ambiguity that has cost this port rounds.
++		OpenQ4_iOS_BlackBox( "*** engine Error: %s ***", msg );
++	}
++#endif
+ 	va_list		argptr;
+ 	static int	lastErrorTime;
+ 	static int	errorCount;
+@@ -1450,6 +1513,16 @@
+ ==================
+ */
+ void idCommonLocal::FatalError( const char *fmt, ... ) {
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	{
++		va_list ap;
++		char msg[1024];
++		va_start( ap, fmt );
++		idStr::vsnPrintf( msg, sizeof( msg ) - 1, fmt, ap );
++		va_end( ap );
++		OpenQ4_iOS_BlackBox( "*** engine FatalError: %s ***", msg );
++	}
++#endif
+ 	va_list		argptr;
+ 
+ 	// if we got a recursive error, make it fatal
+@@ -4208,8 +4281,51 @@
+ 	}
+ }
+ 
++#if defined( OPENQ4_VISIONOS_3D )
+ /*
+ =================
++Com_DeferTeardownWhile3D
++
++openQ4-visionOS (D-114). A game-module swap or engine reload destroys and
++rebuilds the Vulkan device under the 3D panel: the shell's compositor thread
++keeps sampling stereo images of a device that no longer exists, and the
++multiplayer module will not even accept r_stereo3d, so an Arena match started
++from 3D froze the panel on its loading frame or crashed (the stereo pairs
++outlived their device; vk_GuiExecutor.cpp now releases them on shutdown too).
++
++So the teardown waits for 3D to end: the shell runs its ordinary exit (thread
++stop, dismiss, r_stereo3d 0 through this command queue, curtain down) and the
++command re-queues itself one frame later until that has finished. The menu and
++the loading screen keep drawing meanwhile, in the window the exit restores.
++Bounded: if the exit has not finished in 10 s the swap goes ahead regardless
++(the renderer side is safe on its own now) rather than hang the menu click.
++Returns true when the caller must return and let the re-queued command run.
++=================
++*/
++extern "C" int OpenQ4_Vision3D_HoldRendererTeardown( void );
++static int com_teardownWait3DStart;
++
++static bool Com_DeferTeardownWhile3D( const char *command ) {
++	if ( !OpenQ4_Vision3D_HoldRendererTeardown() ) {
++		com_teardownWait3DStart = 0;
++		return false;
++	}
++	const int now = Sys_Milliseconds();
++	if ( com_teardownWait3DStart == 0 ) {
++		com_teardownWait3DStart = now;
++		common->Printf( "%s: leaving 3D before the renderer is rebuilt\n", command );
++	} else if ( now - com_teardownWait3DStart > 10000 ) {
++		common->Warning( "%s: 3D did not finish exiting in 10 s - rebuilding the renderer anyway", command );
++		com_teardownWait3DStart = 0;
++		return false;
++	}
++	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "wait\n%s\n", command ) );
++	return true;
++}
++#endif
++
++/*
++=================
+ Com_ReloadEngine_f
+ =================
+ */
+@@ -4222,7 +4338,13 @@
+ 
+ 	if ( args.Argc() > 1 && idStr::Icmp( args.Argv( 1 ), "menu" ) == 0 ) {
+ 		menu = true;
++	}
++
++#if defined( OPENQ4_VISIONOS_3D )
++	if ( Com_DeferTeardownWhile3D( menu ? "reloadEngine menu" : "reloadEngine" ) ) {
++		return;
+ 	}
++#endif
+ 
+ 	common->Printf( "============= ReloadEngine start =============\n" );
+ 	fileSystem->SetIsFileLoadingAllowed( true );
+@@ -4262,6 +4384,13 @@
+ 		Com_ReloadEngine_f( args );
+ 		return;
+ 	}
++#if defined( OPENQ4_VISIONOS_3D )
++	// postReload (what runs after the swap) stays parked in the command
++	// system until the re-queued reloadGameModule actually swaps.
++	if ( Com_DeferTeardownWhile3D( "reloadGameModule" ) ) {
++		return;
++	}
++#endif
+ 	const idStr previousModule = cvarSystem->GetCVarString( "com_activeGameModule" );
+ 
+ 	common->Printf( "============= ReloadGameModule start =============\n" );
+@@ -6433,6 +6562,16 @@
+ 		return;
+ 	}
+ 
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// iOS is not a host to sniff for — it is the only thing this binary ever
++	// runs on — so the profile is selected outright rather than detected. It is
++	// exec'd before the archived config, so every value in it is a default the
++	// player can overrule and keep.
++	Printf( "Selecting ios platform profile.\n" );
++	com_platformProfile.SetString( "ios" );
++	return;
++#endif
++
+ 	if ( Common_IsEnvFlagTrue( Common_GetNonEmptyEnv( "OPENQ4_DISABLE_STEAMDECK_AUTODETECT" ) ) ||
+ 		 Common_IsEnvFlagTrue( Common_GetNonEmptyEnv( "OPENQ4_NO_STEAMDECK_AUTODETECT" ) ) ) {
+ 		Printf( "Steam Deck platform profile auto-detection disabled by environment.\n" );
+@@ -6561,7 +6700,22 @@
+ 		Sys_FormatMemoryMB( vidRam ).c_str(),
+ 		( oldCard ) ? "a less than optimal video architecture" : "an optimal video architecture" );
+ 
+-	const int machineSpec = Common_DetectMachineSpec( ghz, vidRam, sysRam, oldCard );
++	int machineSpec = Common_DetectMachineSpec( ghz, vidRam, sysRam, oldCard );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// The tier thresholds are 2005-era (300 MB of VRAM qualifies for Ultra), so
++	// every modern device clears them by orders of magnitude. On a desktop that
++	// is harmless. On a phone Ultra loads maximum-resolution textures until
++	// Jetsam kills the process, so the tier is clamped to "high" here regardless
++	// of what the hardware reports.
++	//
++	// This is a memory-budget decision, not a performance one: an A19 Pro can
++	// draw the frame, it just cannot hold the whole Ultra texture set inside an
++	// app memory allowance.
++	if ( machineSpec > 2 ) {
++		common->Printf( "iOS: clamping quality tier %d -> 2 (app memory budget)\n", machineSpec );
++		machineSpec = 2;
++	}
++#endif
+ 	Printf( "%s", Common_MachineSpecQualificationMessage( machineSpec ) );
+ 	com_machineSpec.SetInteger( machineSpec );
+ 	com_videoRam.SetInteger( vidRam );
+@@ -6902,8 +7056,35 @@
+ 		SetMachineSpec();
+ 		Com_ExecMachineSpec_f( args );
+ 		repairedUnsetMachineSpec = true;
++	}
++
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++	// Clamp AFTER the config has been read, not only at detection time.
++	// com_machineSpec is CVAR_ARCHIVE, so a device that once detected Ultra
++	// carries that value forward forever and never re-detects — meaning a
++	// detection-time clamp alone would not rescue an install that has already
++	// written 3. Ultra loads maximum-resolution textures until Jetsam kills the
++	// process, and Jetsam uses SIGKILL, so it leaves no crash report at all.
++	if ( com_machineSpec.GetInteger() > 2 ) {
++		Printf( "iOS: clamping archived quality tier %d -> 2 (app memory budget)\n",
++				com_machineSpec.GetInteger() );
++		com_machineSpec.SetInteger( 2 );
++		Com_ExecMachineSpec_f( args );
+ 	}
+ 
++	// Same archived-value trap as the quality tier, and for the same reason: the
++	// platform profile sets this but is exec'd BEFORE the saved config, so an
++	// install that once wrote 6 keeps it forever. A phone has two speakers;
++	// requesting 5.1 builds a six-channel mixer that is downmixed to stereo
++	// anyway, and it is what makes EFX setup fail with AL_OUT_OF_MEMORY.
++	// Placed here because the sound system initialises immediately after.
++	if ( cvarSystem->GetCVarInteger( "s_numberOfSpeakers" ) != 2 ) {
++		Printf( "iOS: clamping s_numberOfSpeakers %d -> 2 (device has two speakers)\n",
++				cvarSystem->GetCVarInteger( "s_numberOfSpeakers" ) );
++		cvarSystem->SetCVarInteger( "s_numberOfSpeakers", 2 );
++	}
++#endif
++
+ 	Common_MigrateLegacyConsoleAllowCVar();
+ 
+ 	// Unconditional, because the "This system qualifies for ..." banner above
+@@ -6986,7 +7167,15 @@
+ 	if ( sysDetect ) {
+ 		SetMachineSpec();
+ 		Com_ExecMachineSpec_f( args );
++#if defined( __APPLE__ ) && TARGET_OS_IPHONE
++		// A phone has two speakers. Requesting 5.1 makes openal-soft build a
++		// six-channel mixer that is downmixed to stereo anyway, and on this
++		// device it is what makes EFX setup fail with AL_OUT_OF_MEMORY —
++		// silently disabling reverb, which the charter wants audible.
++		cvarSystem->SetCVarInteger( "s_numberOfSpeakers", 2 );
++#else
+ 		cvarSystem->SetCVarInteger( "s_numberOfSpeakers", 6 );
++#endif
+ 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "s_restart\n" );
+ 		cmdSystem->ExecuteCommandBuffer();
+ 	}
